@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.dedup_runtime/
+.dedup_sample/
+photo_hashes.json
+photo_hashes.bak
+photo_hashes.pickle
+*_quarantine/
+quarantine_folder/
