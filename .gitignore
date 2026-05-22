@@ -8,3 +8,11 @@ photo_hashes.bak
 photo_hashes.pickle
 *_quarantine/
 quarantine_folder/
+tools/
+vdf_*_db/
+vdf_phone_pics_db*/
+*_hashes.json
+*_report.txt
+*_report.json
+*_console.log
+*_plan.txt
