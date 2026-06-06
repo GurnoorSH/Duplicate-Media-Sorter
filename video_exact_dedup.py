@@ -15,9 +15,10 @@ import json
 import os
 import shutil
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 VIDEO_EXTENSIONS = {
@@ -42,6 +43,10 @@ DEFAULT_CACHE = Path("video_exact_hashes.json")
 BUFFER_SIZE = 1024 * 1024
 
 
+class VideoScanCancelled(RuntimeError):
+    """Raised when a caller cancels a video scan."""
+
+
 @dataclass(frozen=True)
 class VideoRecord:
     path: Path
@@ -49,11 +54,13 @@ class VideoRecord:
     digest: str
 
 
-def iter_video_files(root: Path) -> Iterable[Path]:
+def iter_video_files(root: Path, exclude_dirs: Sequence[str] = ()) -> Iterable[Path]:
     def on_walk_error(error: OSError) -> None:
         print(f"Warning: could not read directory: {error}", file=sys.stderr)
 
-    for directory, _dirs, files in os.walk(root, onerror=on_walk_error):
+    excluded = {name.casefold() for name in exclude_dirs}
+    for directory, dirs, files in os.walk(root, onerror=on_walk_error):
+        dirs[:] = [name for name in dirs if name.casefold() not in excluded]
         directory_path = Path(directory)
         for filename in files:
             candidate = directory_path / filename
@@ -94,14 +101,23 @@ def hash_file(path: Path, algorithm: str) -> str:
     return hasher.hexdigest()
 
 
-def scan_videos(root: Path, cache_path: Path, algorithm: str) -> list[VideoRecord]:
+def scan_videos(
+    root: Path,
+    cache_path: Path,
+    algorithm: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    exclude_dirs: Sequence[str] = (),
+) -> list[VideoRecord]:
     cache = load_cache(cache_path)
     next_cache: dict[str, dict[str, object]] = {}
     records: list[VideoRecord] = []
-    video_files = list(iter_video_files(root))
+    video_files = list(iter_video_files(root, exclude_dirs))
     print(f"Found {len(video_files)} video files under {root}")
 
     for index, path in enumerate(video_files, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoScanCancelled("video scan cancelled")
         try:
             size, mtime_ns = file_fingerprint(path)
             key = str(path.resolve())
@@ -129,6 +145,8 @@ def scan_videos(root: Path, cache_path: Path, algorithm: str) -> list[VideoRecor
 
         if index % 100 == 0 or index == len(video_files):
             print(f"Hashed {index}/{len(video_files)} videos", flush=True)
+        if progress_callback is not None:
+            progress_callback(index, len(video_files), f"Hashed {index}/{len(video_files)} videos")
 
     save_cache(cache_path, next_cache)
     return records

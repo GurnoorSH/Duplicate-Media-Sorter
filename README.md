@@ -3,7 +3,8 @@
 Safety-first tools for finding duplicate media in large, nested phone/photo
 archives.
 
-The project now handles two media lanes:
+The project now handles two media lanes and includes a local Windows desktop
+interface for reviewing groups before anything moves:
 
 - Images: perceptual duplicate detection through the `duplicate_images`
   `find-dups` CLI, wrapped by `dedup_manager.py`.
@@ -17,7 +18,7 @@ quarantine output has been verified.
 
 ## Setup
 
-Use Python 3.9 or newer.
+Use Python 3.12 or newer. `duplicate_images==0.11.10` requires Python 3.12.
 
 ```powershell
 python -m venv .venv
@@ -25,21 +26,55 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-The Python dependency file includes:
+The pinned Python dependency file includes:
 
-- `duplicate_images>=0.11.0`
-- `pillow-heif>=1.0.0`
+- `duplicate_images==0.11.10`
+- `Pillow==12.2.0`
+- `pillow-heif==1.3.0`
+- `PySide6==6.11.1`
 
 `pillow-heif` lets Pillow decode HEIC/HEIF files from phones. When HEIC files
 are detected, `dedup_manager.py` registers the HEIF opener in the current
 process and injects a small `sitecustomize.py` bootstrap so the `find-dups`
 subprocess registers it too.
 
-For near-duplicate video scans, install VDF CLI and FFmpeg shared binaries under
-`tools/`:
+## Desktop App
+
+Launch the desktop interface after setup:
+
+```powershell
+.\start_app.ps1
+```
+
+The interface provides:
+
+- A native source-folder picker and editable sibling quarantine-folder default.
+- A loader with scan stage details and cancellation.
+- Grouped photo and exact-video review cards. The suggested original can be
+  changed before quarantine and each duplicate can be selected individually.
+- Local video playback through Qt Multimedia.
+- A quarantined-results screen with grouped files, the retained original, and
+  restore actions.
+- An optional near-video toggle when VDF, FFmpeg, and FFprobe are installed
+  under `tools\` or available on `PATH`.
+
+The app writes caches and temporary scan results below:
+
+`%LOCALAPPDATA%\DuplicateMediaSorter\libraries\<root-hash>\`
+
+Each quarantine operation writes a recoverable manifest below:
+
+`<quarantine>\.duplicate-media-sorter\runs\<run-id>.json`
+
+The manifest is updated after every move. Restore never overwrites an occupied
+original path; the interface reports the conflict for manual review.
+
+For near-duplicate video scans, install VDF CLI plus FFmpeg and FFprobe shared
+binaries under `tools/`:
 
 - `tools\vdf\cli\vdf-cli.exe`
 - `tools\vdf\ffmpeg-shared\...\bin\ffmpeg.exe`
+- `tools\vdf\ffmpeg-shared\...\bin\ffprobe.exe`
 
 The `tools/` directory is ignored by git because these are downloaded runtime
 artifacts.
