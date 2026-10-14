@@ -13,12 +13,14 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
+
+if TYPE_CHECKING:
+    from media_sorter import DuplicateGroup
 
 
 VIDEO_EXTENSIONS = {
@@ -159,55 +161,20 @@ def duplicate_groups(records: Sequence[VideoRecord]) -> list[list[VideoRecord]]:
     return [sorted(group, key=lambda item: str(item.path).lower()) for group in buckets.values() if len(group) > 1]
 
 
-def relative_quarantine_path(path: Path) -> Path:
-    resolved = path.resolve()
-    parts = list(resolved.parts)
-    if parts and parts[0].endswith("\\"):
-        parts = parts[1:]
-    return Path(*parts)
-
-
-def unique_destination(destination: Path) -> Path:
-    if not destination.exists():
-        return destination
-
-    stem = destination.stem
-    suffix = destination.suffix
-    parent = destination.parent
-    counter = 1
-    while True:
-        candidate = parent / f"{stem}__duplicate_{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
-
-
-def write_report(report_path: Path, groups: Sequence[Sequence[VideoRecord]]) -> None:
+def write_report(report_path: Path, groups: Sequence["DuplicateGroup"]) -> None:
     if report_path.parent != Path("."):
         report_path.parent.mkdir(parents=True, exist_ok=True)
     with report_path.open("w", encoding="utf-8") as handle:
         handle.write(f"Exact duplicate video groups: {len(groups)}\n")
         for index, group in enumerate(groups, start=1):
-            total_size = sum(record.size for record in group)
-            reclaimable = sum(record.size for record in group[1:])
-            handle.write(f"\nGroup {index}: {len(group)} files, size={group[0].size}, reclaimable={reclaimable}, total={total_size}\n")
-            handle.write(f"KEEP {group[0].path}\n")
-            for record in group[1:]:
-                handle.write(f"MOVE {record.path}\n")
-
-
-def quarantine_groups(groups: Sequence[Sequence[VideoRecord]], quarantine_dir: Path, dry_run: bool) -> int:
-    moved = 0
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-    for group in groups:
-        for record in group[1:]:
-            destination = unique_destination(quarantine_dir / relative_quarantine_path(record.path))
-            print(f"Move {record.path} -> {destination}")
-            if not dry_run:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(record.path), str(destination))
-            moved += 1
-    return moved
+            size = group.items[0].size
+            handle.write(
+                f"\nGroup {index}: {len(group.items)} files, size={size}, "
+                f"reclaimable={group.reclaimable_bytes}, total={size * len(group.items)}\n"
+            )
+            handle.write(f"KEEP {group.keeper_path}\n")
+            for item in group.duplicates:
+                handle.write(f"MOVE {item.path}\n")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -217,31 +184,43 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--report", type=Path, default=Path("video_exact_report.txt"))
     parser.add_argument("--quarantine-dir", type=Path, default=None)
-    parser.add_argument("--algorithm", choices=hashlib.algorithms_available, default="sha256")
+    # SHAKE digests need an explicit length for hexdigest(), so they are excluded.
+    algorithms = sorted(name for name in hashlib.algorithms_guaranteed if not name.startswith("shake_"))
+    parser.add_argument("--algorithm", choices=algorithms, default="sha256")
     parser.add_argument("--dry-run-moves", action="store_true", help="Print quarantine moves without moving files.")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # media_sorter imports this module, so import it lazily to avoid a cycle.
+    from media_sorter import exact_video_groups, quarantine_groups
+
     args = parse_args(argv)
-    target = args.target.expanduser()
+    target = args.target.expanduser().resolve()
     if not target.exists():
         print(f"Error: target does not exist: {target}", file=sys.stderr)
         return 1
 
-    records = scan_videos(target, args.cache, args.algorithm)
-    groups = duplicate_groups(records)
+    quarantine_dir = (args.quarantine_dir or target.parent / f"{target.name}_video_quarantine_exact").expanduser().resolve()
+    exclude = (quarantine_dir.name,) if quarantine_dir.is_relative_to(target) else ()
+    records = scan_videos(target, args.cache, args.algorithm, exclude_dirs=exclude)
+    groups = exact_video_groups(records)
     write_report(args.report, groups)
     print(f"Exact duplicate groups: {len(groups)}")
     print(f"Report: {args.report}")
 
     if args.mode == "quarantine":
-        quarantine_dir = args.quarantine_dir
-        if quarantine_dir is None:
-            quarantine_dir = target.parent / f"{target.name}_video_quarantine_exact"
-        moved = quarantine_groups(groups, quarantine_dir, args.dry_run_moves)
-        action = "Would move" if args.dry_run_moves else "Moved"
-        print(f"{action} {moved} exact duplicate video files to {quarantine_dir}")
+        if args.dry_run_moves:
+            count = sum(len(group.duplicates) for group in groups)
+            print(f"Would move {count} exact duplicate video files to {quarantine_dir} (see MOVE lines in the report)")
+            return 0
+        manifest = quarantine_groups(target, quarantine_dir, groups)
+        statuses = [entry.status for entry in manifest.entries]
+        print(
+            f"Moved {statuses.count('moved')} exact duplicate video files to {quarantine_dir}, "
+            f"skipped {statuses.count('skipped')}, failed {statuses.count('error')}. Restore manifest: {manifest.path}"
+        )
+        return 1 if statuses.count("error") else 0
 
     return 0
 

@@ -7,7 +7,10 @@ The project now handles two media lanes and includes a local Windows desktop
 interface for reviewing groups before anything moves:
 
 - Images: perceptual duplicate detection through the `duplicate_images`
-  `find-dups` CLI, wrapped by `dedup_manager.py`.
+  `find-dups` CLI, wrapped by `dedup_manager.py`. Every perceptual match is
+  then split into **identical copies** (same bytes, verified with SHA-256) and
+  **similar images** (burst shots, edits, resized or re-sent copies). Only
+  identical copies are acted on by default; similar groups need review.
 - Videos: exact byte-for-byte duplicate detection through
   `video_exact_dedup.py`, plus near-duplicate detection through Video Duplicate
   Finder (VDF).
@@ -50,11 +53,15 @@ The interface provides:
 
 - A native source-folder picker and editable sibling quarantine-folder default.
 - A loader with scan stage details and cancellation.
-- Grouped photo and exact-video review cards. The suggested original can be
-  changed before quarantine and each duplicate can be selected individually.
+- Review categories for identical photos, similar photos, exact videos, and
+  near videos, paged 20 groups at a time with thumbnails loaded in the
+  background. Identical and exact groups are pre-selected; similar and near
+  groups start unselected. The suggested original can be changed and each
+  duplicate can be selected individually or a whole category at once.
 - Local video playback through Qt Multimedia.
 - A quarantined-results screen with grouped files, the retained original, and
-  restore actions.
+  restore actions. **Restore a Previous Run** on the start screen reopens any
+  earlier run's manifest, so restores work after the app has been closed.
 - An optional near-video toggle when VDF, FFmpeg, and FFprobe are installed
   under `tools\` or available on `PATH`.
 
@@ -66,8 +73,16 @@ Each quarantine operation writes a recoverable manifest below:
 
 `<quarantine>\.duplicate-media-sorter\runs\<run-id>.json`
 
-The manifest is updated after every move. Restore never overwrites an occupied
-original path; the interface reports the conflict for manual review.
+Each move is appended to a journal beside the manifest
+(`<run-id>.journal.jsonl`) and the full manifest is rewritten periodically and
+at the end, so an interrupted run is still fully recoverable. Restore never
+overwrites an occupied original path; the interface reports the conflict for
+manual review. A duplicate is skipped, never moved, if the copy chosen to keep
+is no longer in place.
+
+The suggested original prefers the highest resolution, then the largest file,
+then a name that is not a copy (`- Copy`, `(1)`, `_copy`), then the oldest
+file.
 
 For near-duplicate video scans, install VDF CLI plus FFmpeg and FFprobe shared
 binaries under `tools/`:
@@ -89,10 +104,12 @@ python .\dedup_manager.py "D:\Photos\Consolidated Library" `
   --cache ".\photo_hashes.json"
 ```
 
-This prints duplicate groups and creates or reuses the hash cache. No files are
-moved or deleted.
+This prints every group tagged `IDENTICAL` or `SIMILAR, review`, with the
+copy to keep and the files that would move, and creates or reuses the hash
+cache plus a `<cache>_digests.json` byte-hash cache. No files are moved or
+deleted.
 
-### Stage 2: quarantine smaller duplicates
+### Stage 2: quarantine duplicates
 
 ```powershell
 python .\dedup_manager.py "D:\Photos\Consolidated Library" `
@@ -101,9 +118,11 @@ python .\dedup_manager.py "D:\Photos\Consolidated Library" `
   --quarantine-dir "D:\Photos\Duplicate Image Quarantine"
 ```
 
-This uses `--on-equal move-smallest` and `--move-recreate-path`, preserving the
-source folder structure under the quarantine directory. The original library
-keeps the larger/better-ranked copy.
+Every extra identical copy is moved under `<quarantine>\photos\`, keeping its
+path relative to the library, and a restorable manifest is written (the same
+format the desktop app uses). Similar groups are left alone unless you pass
+`--include-similar`, which keeps the highest-resolution image of each group and
+moves the rest; review those groups in the desktop app first.
 
 ### Stage 3: optional image delete
 
@@ -113,7 +132,9 @@ python .\dedup_manager.py "D:\Photos\Consolidated Library" `
   --cache ".\photo_hashes.json"
 ```
 
-Delete mode is destructive. The wrapper requires typing `DELETE` before it runs.
+Delete mode is destructive and permanently removes the same files quarantine
+mode would move (identical copies only, unless `--include-similar`). The
+wrapper requires typing `DELETE` before it runs.
 For non-interactive automation, pass `--yes` only after validating a dry-run and
 preferably a quarantine run.
 
@@ -146,9 +167,13 @@ python .\video_exact_dedup.py "D:\Photos\Consolidated Library" `
   --quarantine-dir "D:\Photos\Duplicate Video Exact Quarantine"
 ```
 
-The script keeps one copy from each exact group and moves the duplicate copies
-into the quarantine folder, preserving their source-relative paths. It does not
-delete files.
+The script keeps one copy from each exact group (a name that is not a copy,
+then the oldest file) and moves the other copies under
+`<quarantine>\videos\exact\`, preserving their source-relative paths. It writes
+the same restorable manifest as the desktop app, so a run can be restored from
+the app's **Restore a Previous Run** button. A failed move is recorded and the
+run continues. It does not delete files. `--dry-run-moves` reports what would
+move without moving anything.
 
 ## Near-Duplicate Video Workflow
 
@@ -201,6 +226,10 @@ source of truth. A successful clean run should exit `0`, write
   mode intentionally avoids `--max-distance` because upstream documents it as
   incompatible with `--group` and much slower on large libraries.
 - `--exclude-dir REGEX`: repeat to skip generated or archival folders.
+  `find-dups` applies `re.search` to each file's full parent path, so anchor a
+  folder name as a path component, for example `(?i)[\\/]Thumbnails([\\/]|$)`.
+- `--include-similar`: also quarantine or delete similar (not identical) photo
+  groups.
 - `--parallel-workers N`: limit image hashing CPU worker count; otherwise
   `find-dups` uses all free cores.
 - `--print-command-only`: validate image paths and show the exact `find-dups`
@@ -208,9 +237,16 @@ source of truth. A successful clean run should exit `0`, write
 - VDF `--percent 96`: strict near-video threshold used in the current workflow.
   Lower values may find more candidates but increase false positives.
 
-Paths are passed to subprocesses as argument lists rather than shell strings, so
-names such as `WhatsApp Image 2026...jpeg` and folders with spaces are handled
-without extra quoting.
+Paths are passed to subprocesses as argument lists rather than shell strings,
+and `find-dups` is asked to print each group as shell-quoted paths on stdout
+(`--on-equal quote`), which the tools parse directly. No group ever passes
+through `cmd.exe`, so names containing spaces, apostrophes, `&`, `%`, `^`, or
+non-Latin scripts are handled exactly.
+
+`find-dups` is launched as `python -m duplicate_images.duplicate` with the
+running interpreter rather than through `.venv\Scripts\find-dups.exe`. Those
+launchers embed the interpreter path from install time and stop working,
+silently, when the project folder is moved.
 
 ## Recent Phone Pics Run
 

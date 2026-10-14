@@ -8,25 +8,46 @@ quarantine manifests for the desktop interface.
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import importlib.util
 import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from video_exact_dedup import VideoScanCancelled, duplicate_groups, scan_videos
+from video_exact_dedup import (
+    VideoRecord,
+    VideoScanCancelled,
+    duplicate_groups,
+    hash_file,
+    load_cache,
+    save_cache,
+    scan_videos,
+)
 
 
 MANIFEST_VERSION = 1
+MANIFEST_SAVE_INTERVAL = 250
+DEFAULT_FIND_DUPS = "find-dups"
+FIND_DUPS_MODULE = "duplicate_images.duplicate"
+# Names such as "IMG_1 - Copy", "IMG_1 - Copy (2)", "IMG_1 (1)", "IMG_1_copy" or
+# our own "IMG_1__duplicate_1" mark a file as the copy rather than the original.
+COPY_NAME_PATTERN = re.compile(r"(?:\s*-\s*copy(?:\s*\(\d+\))?|\s*\(\d+\)|[\s_]copy|__duplicate_\d+)$", re.IGNORECASE)
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+PATH_SEPARATOR_PATTERN = r"[\\/]"
 PHOTO_LANE = "photos"
 EXACT_VIDEO_LANE = "videos_exact"
 NEAR_VIDEO_LANE = "videos_near"
@@ -87,6 +108,9 @@ class DuplicateGroup:
     lane: str
     items: list[MediaItem]
     keeper_path: Path
+    # True when every file in the group has identical bytes. Groups that only
+    # look alike (re-encodes, burst frames, edits) are False and need review.
+    exact: bool = False
 
     @property
     def keeper(self) -> MediaItem:
@@ -114,6 +138,7 @@ class DuplicateGroup:
             "lane": self.lane,
             "keeper_path": str(self.keeper_path),
             "items": [item.to_dict() for item in self.items],
+            "exact": self.exact,
         }
 
     @classmethod
@@ -123,6 +148,7 @@ class DuplicateGroup:
             lane=str(raw["lane"]),
             keeper_path=Path(str(raw["keeper_path"])),
             items=[MediaItem.from_dict(item) for item in raw["items"]],  # type: ignore[arg-type]
+            exact=bool(raw.get("exact", False)),
         )
 
 
@@ -182,20 +208,48 @@ class RunManifest:
     def path(self) -> Path:
         return manifest_path(Path(self.quarantine_root), self.run_id)
 
+    @property
+    def journal_path(self) -> Path:
+        return journal_path_for(self.path)
+
     def save(self) -> Path:
+        """Write the full manifest and clear the journal it now contains."""
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
         temporary.replace(path)
+        self.journal_path.unlink(missing_ok=True)
         return path
+
+    def record(self, entry: ManifestEntry) -> None:
+        """Append one entry's current state to the journal.
+
+        Rewriting the whole manifest after every move is quadratic for large
+        runs, so per-file progress goes to an append-only journal and the full
+        manifest is saved periodically. ``load`` replays the journal, so a run
+        interrupted between saves is still fully recoverable.
+        """
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.journal_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(asdict(entry)) + "\n")
+            handle.flush()
 
     @classmethod
     def load(cls, path: Path) -> "RunManifest":
         raw = json.loads(path.read_text(encoding="utf-8"))
         if raw.get("version") != MANIFEST_VERSION:
             raise ValueError(f"unsupported manifest version: {raw.get('version')}")
-        raw["entries"] = [ManifestEntry(**entry) for entry in raw.get("entries", [])]
+        entries = {entry["id"]: ManifestEntry(**entry) for entry in raw.get("entries", [])}
+        journal = journal_path_for(path)
+        if journal.exists():
+            for line in journal.read_text(encoding="utf-8").splitlines():
+                try:
+                    entry = ManifestEntry(**json.loads(line))
+                except (json.JSONDecodeError, TypeError):
+                    continue  # A torn final line from an interrupted write.
+                entries[entry.id] = entry
+        raw["entries"] = list(entries.values())
         return cls(**raw)
 
 
@@ -213,8 +267,22 @@ def emit(callback: ProgressCallback | None, progress: ScanProgress) -> None:
         callback(progress)
 
 
+def path_key(path: Path) -> str:
+    # abspath rather than resolve(): resolve() opens each file on Windows,
+    # which adds up across tens of thousands of comparisons.
+    return os.path.normcase(os.path.abspath(path))
+
+
 def paths_equal(first: Path, second: Path) -> bool:
-    return os.path.normcase(str(first.resolve())) == os.path.normcase(str(second.resolve()))
+    return path_key(first) == path_key(second)
+
+
+def is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def default_quarantine_dir(source_root: Path) -> Path:
@@ -239,11 +307,19 @@ def library_workspace(source_root: Path) -> Path:
 
 
 def manifest_path(quarantine_root: Path, run_id: str) -> Path:
-    return quarantine_root / ".duplicate-media-sorter" / "runs" / f"{run_id}.json"
+    return runs_dir(quarantine_root) / f"{run_id}.json"
+
+
+def journal_path_for(manifest: Path) -> Path:
+    return manifest.with_suffix(".journal.jsonl")
+
+
+def runs_dir(quarantine_root: Path) -> Path:
+    return quarantine_root / ".duplicate-media-sorter" / "runs"
 
 
 def list_run_manifests(quarantine_root: Path) -> list[Path]:
-    runs = quarantine_root / ".duplicate-media-sorter" / "runs"
+    runs = runs_dir(quarantine_root)
     if not runs.exists():
         return []
     return sorted(runs.glob("*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
@@ -251,22 +327,28 @@ def list_run_manifests(quarantine_root: Path) -> list[Path]:
 
 def automatic_exclude_names(source_root: Path, quarantine_root: Path) -> tuple[str, ...]:
     names = list(SYSTEM_EXCLUDE_DIRS)
-    try:
-        quarantine_root.resolve().relative_to(source_root.resolve())
-    except ValueError:
-        pass
-    else:
+    if is_within(quarantine_root, source_root):
         names.append(quarantine_root.name)
     return tuple(dict.fromkeys(names))
 
 
 def photo_exclude_patterns(source_root: Path, quarantine_root: Path) -> tuple[str, ...]:
-    return tuple(f"^{re.escape(name)}$" for name in automatic_exclude_names(source_root, quarantine_root))
+    """Regexes for find-dups ``--exclude-dir``.
+
+    find-dups applies ``re.search`` to each file's full parent path, so system
+    folders are matched as whole path components and an internal quarantine
+    folder is matched by its absolute path.
+    """
+    separator = PATH_SEPARATOR_PATTERN
+    patterns = [rf"(?i)(?:^|{separator}){re.escape(name)}(?:{separator}|$)" for name in SYSTEM_EXCLUDE_DIRS]
+    if is_within(quarantine_root, source_root):
+        patterns.append(rf"(?i)^{re.escape(str(quarantine_root.resolve()))}(?:{separator}|$)")
+    return tuple(patterns)
 
 
-def group_id(lane: str, paths: Iterable[Path]) -> str:
-    normalized = sorted(os.path.normcase(str(path.resolve())) for path in paths)
-    digest = hashlib.sha256((lane + "\0" + "\0".join(normalized)).encode("utf-8")).hexdigest()[:16]
+def group_id(lane: str, paths: Iterable[Path], kind: str = "") -> str:
+    normalized = sorted(path_key(path) for path in paths)
+    digest = hashlib.sha256((lane + kind + "\0" + "\0".join(normalized)).encode("utf-8")).hexdigest()[:16]
     return f"{lane}-{digest}"
 
 
@@ -275,15 +357,18 @@ def media_item_for_file(path: Path, lane: str) -> MediaItem:
     return MediaItem(path=path, lane=lane, size=stat.st_size, modified_ns=stat.st_mtime_ns)
 
 
-def photo_item(path: Path) -> MediaItem:
-    item = media_item_for_file(path, PHOTO_LANE)
+@functools.cache
+def register_heif_support() -> None:
     try:
         from pillow_heif import register_heif_opener
-
-        register_heif_opener()
     except ImportError:
-        pass
+        return
+    register_heif_opener()
 
+
+def photo_item(path: Path) -> MediaItem:
+    item = media_item_for_file(path, PHOTO_LANE)
+    register_heif_support()
     try:
         from PIL import Image
 
@@ -294,12 +379,17 @@ def photo_item(path: Path) -> MediaItem:
     return item
 
 
+def copy_name_penalty(path: Path) -> int:
+    return 1 if COPY_NAME_PATTERN.search(path.stem) else 0
+
+
 def photo_keeper(items: Sequence[MediaItem]) -> MediaItem:
     return min(
         items,
         key=lambda item: (
             -item.pixel_area,
             -item.size,
+            copy_name_penalty(item.path),
             item.modified_ns,
             os.path.normcase(str(item.path)),
         ),
@@ -307,7 +397,7 @@ def photo_keeper(items: Sequence[MediaItem]) -> MediaItem:
 
 
 def exact_video_keeper(items: Sequence[MediaItem]) -> MediaItem:
-    return min(items, key=lambda item: (item.modified_ns, os.path.normcase(str(item.path))))
+    return min(items, key=lambda item: (copy_name_penalty(item.path), item.modified_ns, os.path.normcase(str(item.path))))
 
 
 def near_video_keeper(items: Sequence[MediaItem]) -> MediaItem:
@@ -317,25 +407,37 @@ def near_video_keeper(items: Sequence[MediaItem]) -> MediaItem:
             -item.pixel_area,
             -(item.bitrate_kbps or 0),
             -item.size,
+            copy_name_penalty(item.path),
             os.path.normcase(str(item.path)),
         ),
     )
 
 
-def capture_command(output_path: Path, capture_script: Path | None = None) -> str:
-    script = capture_script or Path(__file__).with_name("capture_group.py")
-    base = subprocess.list2cmdline([sys.executable, str(script), "--output", str(output_path)])
-    return f"{base} {{*}}"
+def find_dups_command_prefix(configured: str = DEFAULT_FIND_DUPS) -> list[str] | None:
+    """Return the argv prefix that launches find-dups, or None if unavailable.
+
+    The default runs the installed module with this interpreter. Console-script
+    launchers such as ``.venv\\Scripts\\find-dups.exe`` embed the interpreter
+    path from install time and fail silently once the project folder moves.
+    """
+    if configured == DEFAULT_FIND_DUPS and importlib.util.find_spec("duplicate_images") is not None:
+        return [sys.executable, "-m", FIND_DUPS_MODULE]
+    discovered = shutil.which(configured)
+    if discovered:
+        return [discovered]
+    configured_path = Path(configured)
+    if configured_path.exists():
+        return [str(configured_path.resolve())]
+    return None
 
 
 def build_photo_scan_command(
     request: ScanRequest,
-    group_output: Path,
     cache_path: Path,
-    capture_script: Path | None = None,
+    find_dups: Sequence[str] = (DEFAULT_FIND_DUPS,),
 ) -> list[str]:
     command = [
-        request.find_dups_executable,
+        *find_dups,
         str(request.source_root),
         "--parallel",
         "--progress",
@@ -351,20 +453,21 @@ def build_photo_scan_command(
     if patterns:
         command.append("--exclude-dir")
         command.extend(patterns)
-    command.extend(["--on-equal", "exec", "--exec", capture_command(group_output, capture_script)])
+    # "quote" prints each group as one line of shell-quoted paths on stdout.
+    # The previous "--on-equal exec" route ran every group through cmd.exe,
+    # where '&', '%' or '^' in a file name broke parsing or ran commands.
+    command.extend(["--on-equal", "quote"])
     return command
 
 
-def find_find_dups_executable(configured: str) -> str | None:
-    discovered = shutil.which(configured)
-    if discovered:
-        return discovered
-    configured_path = Path(configured)
-    if configured_path.exists():
-        return str(configured_path.resolve())
-    sibling_name = "find-dups.exe" if os.name == "nt" else "find-dups"
-    sibling = Path(sys.executable).with_name(sibling_name)
-    return str(sibling) if sibling.exists() else None
+def find_dups_environment(extra_pythonpath: Path | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    # Paths are printed on stdout; force UTF-8 so non-ASCII names survive the pipe.
+    env["PYTHONIOENCODING"] = "utf-8"
+    if extra_pythonpath is not None:
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{extra_pythonpath}{os.pathsep}{existing}" if existing else str(extra_pythonpath)
+    return env
 
 
 def stream_process(
@@ -373,28 +476,47 @@ def stream_process(
     cancel_event: threading.Event | None,
     stage: str,
     env: dict[str, str] | None = None,
+    stdout_lines: list[str] | None = None,
 ) -> int:
+    """Run a command, forwarding its output as progress.
+
+    When ``stdout_lines`` is given, stdout is collected there as data and only
+    stderr is forwarded as progress.
+    """
     emit(callback, ScanProgress(stage, subprocess.list2cmdline(list(command))))
+    capture = stdout_lines is not None
     process = subprocess.Popen(
         list(command),
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if capture else subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
         errors="replace",
         env=env,
     )
-    output_queue: queue.Queue[str | None] = queue.Queue()
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
-    def collect_output() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            output_queue.put(line.rstrip())
-        output_queue.put(None)
+    def collect_output(stream, name: str) -> None:  # type: ignore[no-untyped-def]
+        for line in stream:
+            output_queue.put((name, line.rstrip("\r\n")))
+        output_queue.put((name, None))
 
-    output_thread = threading.Thread(target=collect_output, daemon=True)
-    output_thread.start()
-    stream_closed = False
-    while not stream_closed:
+    streams = [(process.stdout, "stdout")]
+    if capture:
+        streams.append((process.stderr, "stderr"))
+    threads = [threading.Thread(target=collect_output, args=stream, daemon=True) for stream in streams]
+    for thread in threads:
+        thread.start()
+
+    def close() -> None:
+        for thread in threads:
+            thread.join(timeout=1)
+        for stream, _name in streams:
+            if stream is not None:
+                stream.close()
+
+    open_streams = len(streams)
+    while open_streams:
         if cancel_event is not None and cancel_event.is_set():
             process.terminate()
             try:
@@ -402,76 +524,113 @@ def stream_process(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
-            output_thread.join(timeout=1)
-            if process.stdout is not None:
-                process.stdout.close()
+            close()
             raise ScanCancelled("scan cancelled")
         try:
-            line = output_queue.get(timeout=0.1)
+            name, line = output_queue.get(timeout=0.1)
         except queue.Empty:
-            if process.poll() is not None:
-                continue
             continue
         if line is None:
-            stream_closed = True
-        elif line:
-            emit(callback, ScanProgress(stage, line))
+            open_streams -= 1
+        elif capture and name == "stdout":
+            stdout_lines.append(line)  # type: ignore[union-attr]
+        else:
+            line = ANSI_ESCAPE.sub("", line).strip()
+            if line:
+                emit(callback, ScanProgress(stage, line, warning="WARNING" in line))
     return_code = process.wait()
-    output_thread.join(timeout=1)
-    if process.stdout is not None:
-        process.stdout.close()
+    close()
     return return_code
 
 
-def read_jsonl_groups(path: Path) -> list[list[Path]]:
-    if not path.exists():
-        return []
+def parse_quoted_groups(lines: Iterable[str]) -> list[list[Path]]:
+    """Parse ``find-dups --on-equal quote`` output: one shell-quoted group per line."""
     groups: list[list[Path]] = []
     seen: set[tuple[str, ...]] = set()
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line in lines:
         if not line.strip():
             continue
-        raw = json.loads(line)
-        if not isinstance(raw, list) or len(raw) < 2:
-            raise ValueError(f"invalid captured photo group on line {line_number}")
-        paths = [Path(str(value)) for value in raw]
-        key = tuple(sorted(os.path.normcase(str(value.resolve())) for value in paths))
+        try:
+            paths = [Path(value) for value in shlex.split(line, posix=True)]
+        except ValueError:
+            continue  # Not a group line.
+        if len(paths) < 2:
+            continue
+        key = tuple(sorted(os.path.normcase(str(path)) for path in paths))
         if key not in seen:
             groups.append(paths)
             seen.add(key)
     return groups
 
 
-def scan_photos(
-    request: ScanRequest,
+class DigestCache:
+    """SHA-256 digests keyed by resolved path and invalidated by size or mtime."""
+
+    algorithm = "sha256"
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            self.entries = load_cache(path)
+        except (OSError, ValueError):
+            self.entries = {}
+        self.dirty = False
+
+    def digest(self, path: Path) -> str:
+        stat = path.stat()
+        key = str(path.resolve())
+        cached = self.entries.get(key)
+        if (
+            cached
+            and cached.get("size") == stat.st_size
+            and cached.get("mtime_ns") == stat.st_mtime_ns
+            and cached.get("algorithm") == self.algorithm
+        ):
+            return str(cached["digest"])
+        value = hash_file(path, self.algorithm)
+        self.entries[key] = {"algorithm": self.algorithm, "digest": value, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        self.dirty = True
+        return value
+
+    def save(self) -> None:
+        if self.dirty:
+            save_cache(self.path, self.entries)
+            self.dirty = False
+
+
+def split_identical(items: Sequence[MediaItem], digests: DigestCache) -> list[list[MediaItem]]:
+    """Partition files into sets with identical bytes; unique files stay alone."""
+    by_size: dict[int, list[MediaItem]] = defaultdict(list)
+    for item in items:
+        by_size[item.size].append(item)
+    contents: list[list[MediaItem]] = []
+    for same_size in by_size.values():
+        if len(same_size) == 1:
+            contents.append(same_size)
+            continue
+        by_digest: dict[str, list[MediaItem]] = defaultdict(list)
+        for item in same_size:
+            try:
+                key = digests.digest(item.path)
+            except OSError:
+                key = f"unreadable:{item.path}"
+            by_digest[key].append(item)
+        contents.extend(by_digest.values())
+    return contents
+
+
+def build_photo_groups(
+    captured: Sequence[Sequence[Path]],
+    digests: DigestCache,
     callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[DuplicateGroup]:
-    executable = find_find_dups_executable(request.find_dups_executable)
-    if executable is None:
-        raise RuntimeError(
-            f"Could not find '{request.find_dups_executable}'. "
-            "Install dependencies with: python -m pip install -r requirements.txt"
-        )
+    """Turn perceptual-hash matches into exact and similar review groups.
 
-    workspace = library_workspace(request.source_root)
-    workspace.mkdir(parents=True, exist_ok=True)
-    group_output = workspace / "photo_groups.jsonl"
-    group_output.unlink(missing_ok=True)
-    cache_path = workspace / "photo_hashes.json"
-    executable_request = ScanRequest(**{**request.__dict__, "find_dups_executable": executable})
-    command = build_photo_scan_command(executable_request, group_output, cache_path)
-    env = None
-    from dedup_manager import ensure_heif_support, env_with_pythonpath, find_heic_files, write_heif_bootstrap
-
-    if find_heic_files(request.source_root):
-        ensure_heif_support(required=True)
-        env = env_with_pythonpath(write_heif_bootstrap(workspace / ".dedup_runtime"))
-    return_code = stream_process(command, callback, cancel_event, "photos", env)
-    if return_code != 0:
-        raise RuntimeError(f"find-dups exited with status {return_code}")
-
-    captured = read_jsonl_groups(group_output)
+    Each match is split by content: files with identical bytes become an exact
+    group, and when a match holds more than one distinct image, one
+    representative of each forms a similar group that needs human review.
+    """
     total = sum(len(paths) for paths in captured)
     current = 0
     groups: list[DuplicateGroup] = []
@@ -486,9 +645,70 @@ def scan_photos(
                 items.append(photo_item(path))
             except OSError as exc:
                 emit(callback, ScanProgress("photo_metadata", f"Could not inspect {path}: {exc}", warning=True))
-        if len(items) > 1:
-            keeper = photo_keeper(items)
-            groups.append(DuplicateGroup(group_id(PHOTO_LANE, (item.path for item in items)), PHOTO_LANE, items, keeper.path))
+        if len(items) < 2:
+            continue
+        contents = split_identical(items, digests)
+        for copies in contents:
+            if len(copies) > 1:
+                keeper = photo_keeper(copies)
+                groups.append(DuplicateGroup(group_id(PHOTO_LANE, (item.path for item in copies), "exact"), PHOTO_LANE, copies, keeper.path, exact=True))
+        if len(contents) > 1:
+            representatives = [photo_keeper(copies) for copies in contents]
+            keeper = photo_keeper(representatives)
+            groups.append(DuplicateGroup(group_id(PHOTO_LANE, (item.path for item in representatives), "similar"), PHOTO_LANE, representatives, keeper.path))
+    digests.save()
+    return groups
+
+
+def scan_photos(
+    request: ScanRequest,
+    callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+    warnings: list[str] | None = None,
+) -> list[DuplicateGroup]:
+    find_dups = find_dups_command_prefix(request.find_dups_executable)
+    if find_dups is None:
+        raise RuntimeError(
+            f"Could not find '{request.find_dups_executable}'. "
+            "Install dependencies with: python -m pip install -r requirements.txt"
+        )
+
+    workspace = library_workspace(request.source_root)
+    workspace.mkdir(parents=True, exist_ok=True)
+    cache_path = workspace / "photo_hashes.json"
+    command = build_photo_scan_command(request, cache_path, find_dups)
+    from dedup_manager import ensure_heif_support, find_heic_files, write_heif_bootstrap
+
+    bootstrap = None
+    if find_heic_files(request.source_root):
+        ensure_heif_support(required=True)
+        bootstrap = write_heif_bootstrap(workspace / ".dedup_runtime")
+
+    def forward(progress: ScanProgress) -> None:
+        if progress.warning and warnings is not None:
+            warnings.append(progress.message)
+        emit(callback, progress)
+
+    stdout: list[str] = []
+    return_code = stream_process(command, forward, cancel_event, "photos", find_dups_environment(bootstrap), stdout)
+    if return_code != 0:
+        raise RuntimeError(f"find-dups exited with status {return_code}")
+
+    quarantine_root = request.effective_quarantine_root
+    captured = []
+    for paths in parse_quoted_groups(stdout):
+        kept = [path for path in paths if not is_within(path, quarantine_root)]
+        if len(kept) > 1:
+            captured.append(kept)
+    return build_photo_groups(captured, DigestCache(workspace / "photo_digests.json"), callback, cancel_event)
+
+
+def exact_video_groups(records: Sequence[VideoRecord]) -> list[DuplicateGroup]:
+    groups: list[DuplicateGroup] = []
+    for records_group in duplicate_groups(records):
+        items = [media_item_for_file(record.path, EXACT_VIDEO_LANE) for record in records_group]
+        keeper = exact_video_keeper(items)
+        groups.append(DuplicateGroup(group_id(EXACT_VIDEO_LANE, (item.path for item in items)), EXACT_VIDEO_LANE, items, keeper.path, exact=True))
     return groups
 
 
@@ -514,13 +734,7 @@ def scan_exact_videos(
         )
     except VideoScanCancelled as exc:
         raise ScanCancelled(str(exc)) from exc
-
-    groups: list[DuplicateGroup] = []
-    for records_group in duplicate_groups(records):
-        items = [media_item_for_file(record.path, EXACT_VIDEO_LANE) for record in records_group]
-        keeper = exact_video_keeper(items)
-        groups.append(DuplicateGroup(group_id(EXACT_VIDEO_LANE, (item.path for item in items)), EXACT_VIDEO_LANE, items, keeper.path))
-    return groups
+    return exact_video_groups(records)
 
 
 def find_tool(explicit: Path | None, name: str, project_root: Path | None = None) -> Path | None:
@@ -685,7 +899,7 @@ def scan_library(
     warnings: list[str] = []
     if request.include_photos:
         emit(callback, ScanProgress("photos", "Scanning photos"))
-        groups.extend(scan_photos(request, callback, cancel_event))
+        groups.extend(scan_photos(request, callback, cancel_event, warnings))
     if request.include_exact_videos:
         emit(callback, ScanProgress("videos_exact", "Scanning exact videos"))
         groups.extend(scan_exact_videos(request, callback, cancel_event))
@@ -740,33 +954,58 @@ def quarantine_groups(
             if allowed is None or str(item.path) in allowed:
                 candidates.append((group, item))
     manifest.save()
+    moved: set[str] = set()
+    last_save = time.monotonic()
     total = len(candidates)
     for current, (group, item) in enumerate(candidates, start=1):
-        relative = relative_source_path(item.path, source_root)
-        destination = unique_destination(quarantine_root / LANE_FOLDERS[group.lane] / relative)
         entry = ManifestEntry(
             id=uuid.uuid4().hex,
             group_id=group.id,
             lane=group.lane,
             keeper_path=str(group.keeper_path),
             original_path=str(item.path),
-            moved_path=str(destination),
+            moved_path="",
             metadata=item.to_dict(),
         )
         manifest.entries.append(entry)
-        manifest.save()
+        # Never quarantine the last copy: the kept original must still be in
+        # place. It can be gone when an overlapping group (exact and near
+        # video lanes) already moved it, or when the scan is stale.
+        if path_key(group.keeper_path) in moved or not group.keeper_path.exists():
+            entry.status = "skipped"
+            entry.error = f"Kept original is no longer at {group.keeper_path}"
+        elif not item.path.exists():
+            entry.status = "skipped"
+            entry.error = f"File is no longer at {item.path}"
+        if entry.status == "skipped":
+            manifest.record(entry)
+            emit(callback, ScanProgress("quarantine", f"Skipped {item.path.name}: {entry.error}", current, total, percent(current, total), warning=True))
+            continue
+
+        relative = relative_source_path(item.path, source_root)
+        destination = unique_destination(quarantine_root / LANE_FOLDERS[group.lane] / relative)
+        entry.moved_path = str(destination)
+        manifest.record(entry)
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             move_file(str(item.path), str(destination))
             entry.status = "moved"
+            moved.add(path_key(item.path))
             emit(callback, ScanProgress("quarantine", f"Moved {item.path.name}", current, total, percent(current, total)))
         except Exception as exc:
             entry.status = "error"
             entry.error = str(exc)
             manifest.errors.append(f"Could not move {item.path}: {exc}")
             emit(callback, ScanProgress("quarantine", manifest.errors[-1], current, total, percent(current, total), warning=True))
-        manifest.save()
+        manifest.record(entry)
+        if current % MANIFEST_SAVE_INTERVAL == 0 or time.monotonic() - last_save > 30:
+            manifest.save()
+            last_save = time.monotonic()
+    manifest.save()
     return manifest
+
+
+RESTORABLE_STATUSES = ("moved", "restore-blocked", "restore-error")
 
 
 def restore_entries(
@@ -775,7 +1014,7 @@ def restore_entries(
     callback: ProgressCallback | None = None,
     move_file: Callable[[str, str], object] = shutil.move,
 ) -> RunManifest:
-    entries = [entry for entry in manifest.entries if entry.id in entry_ids and entry.status in ("moved", "restore-blocked")]
+    entries = [entry for entry in manifest.entries if entry.id in entry_ids and entry.status in RESTORABLE_STATUSES]
     total = len(entries)
     for current, entry in enumerate(entries, start=1):
         source = Path(entry.moved_path)
@@ -784,42 +1023,37 @@ def restore_entries(
             entry.status = "restore-blocked"
             entry.error = f"Original path is occupied: {destination}"
             emit(callback, ScanProgress("restore", entry.error, current, total, percent(current, total), warning=True))
-            manifest.save()
-            continue
-        if not source.exists():
+        elif not source.exists():
             entry.status = "missing"
             entry.error = f"Quarantined file is missing: {source}"
             emit(callback, ScanProgress("restore", entry.error, current, total, percent(current, total), warning=True))
+        else:
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                move_file(str(source), str(destination))
+                entry.status = "restored"
+                entry.error = None
+                emit(callback, ScanProgress("restore", f"Restored {destination.name}", current, total, percent(current, total)))
+            except Exception as exc:
+                # The file is still in quarantine, so keep it restorable.
+                entry.status = "restore-error"
+                entry.error = str(exc)
+                manifest.errors.append(f"Could not restore {source}: {exc}")
+                emit(callback, ScanProgress("restore", manifest.errors[-1], current, total, percent(current, total), warning=True))
+        manifest.record(entry)
+        if current % MANIFEST_SAVE_INTERVAL == 0:
             manifest.save()
-            continue
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            move_file(str(source), str(destination))
-            entry.status = "restored"
-            entry.error = None
-            emit(callback, ScanProgress("restore", f"Restored {destination.name}", current, total, percent(current, total)))
-        except Exception as exc:
-            entry.status = "error"
-            entry.error = str(exc)
-            manifest.errors.append(f"Could not restore {source}: {exc}")
-            emit(callback, ScanProgress("restore", manifest.errors[-1], current, total, percent(current, total), warning=True))
-        manifest.save()
+    manifest.save()
     return manifest
 
 
 def thumbnail_path(item: MediaItem, size: tuple[int, int] = (280, 180)) -> Path | None:
-    workspace = library_workspace(item.path.parent)
-    thumbnail_dir = workspace / "thumbnails"
+    thumbnail_dir = local_app_data_dir() / "DuplicateMediaSorter" / "thumbnails"
     digest = hashlib.sha256(f"{item.path.resolve()}\0{item.modified_ns}\0{size}".encode("utf-8")).hexdigest()
     output = thumbnail_dir / f"{digest}.jpg"
     if output.exists():
         return output
-    try:
-        from pillow_heif import register_heif_opener
-
-        register_heif_opener()
-    except ImportError:
-        pass
+    register_heif_support()
     try:
         from PIL import Image, ImageOps
 

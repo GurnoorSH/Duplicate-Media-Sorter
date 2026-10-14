@@ -1,29 +1,33 @@
-import json
 import os
+import re
+import shlex
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from capture_group import decode_windows_shlex_args, write_group
 from media_sorter import (
     EXACT_VIDEO_LANE,
     NEAR_VIDEO_LANE,
     PHOTO_LANE,
+    DigestCache,
     DuplicateGroup,
     MediaItem,
     RunManifest,
     ScanRequest,
     automatic_exclude_names,
+    build_photo_groups,
     build_photo_scan_command,
-    capture_command,
     exact_video_keeper,
+    find_dups_command_prefix,
     library_workspace,
     normalize_vdf_report,
+    parse_quoted_groups,
+    photo_exclude_patterns,
     photo_keeper,
     quarantine_groups,
-    read_jsonl_groups,
     restore_entries,
     unique_destination,
 )
@@ -52,49 +56,132 @@ class KeeperSelectionTests(unittest.TestCase):
 
         self.assertEqual(exact_video_keeper(items).path, Path("old.mp4"))
 
-
-class CaptureTests(unittest.TestCase):
-    def test_capture_helper_preserves_spaces_and_apostrophes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "groups.jsonl"
-            paths = [r"C:\Phone Pics\one photo.jpg", r"C:\Phone Pics\Mom's copy.jpg"]
-
-            write_group(output, paths)
-
-            self.assertEqual(read_jsonl_groups(output), [[Path(value) for value in paths]])
-
-    def test_windows_capture_decoder_repairs_upstream_posix_quoting(self) -> None:
-        split_paths = [
-            r"'C:\Phone",
-            r"Pics\Mom'''s",
-            r"copy.jpg'",
-            r"'C:\Phone",
-            r"Pics\original",
-            r"photo.jpg'",
+    def test_identical_photo_keeper_avoids_copy_names(self) -> None:
+        # " - Copy" sorts before "." so a plain path tie-break kept the copy.
+        items = [
+            item(Path("IMG_2311 - Copy.heic"), PHOTO_LANE, 1_000, 5, 200, 200),
+            item(Path("IMG_2311.heic"), PHOTO_LANE, 1_000, 5, 200, 200),
+            item(Path("IMG_2311 (1).heic"), PHOTO_LANE, 1_000, 5, 200, 200),
         ]
 
-        self.assertEqual(
-            decode_windows_shlex_args(split_paths),
-            [r"C:\Phone Pics\Mom's copy.jpg", r"C:\Phone Pics\original photo.jpg"],
-        )
+        self.assertEqual(photo_keeper(items).path, Path("IMG_2311.heic"))
 
-    def test_capture_command_uses_group_wildcard(self) -> None:
-        command = capture_command(Path(r"C:\Temp Folder\groups.jsonl"), Path(r"C:\App Folder\capture_group.py"))
+    def test_exact_video_keeper_avoids_copy_names_before_age(self) -> None:
+        items = [
+            item(Path("clip - Copy.mp4"), EXACT_VIDEO_LANE, 10, 1),
+            item(Path("clip.mp4"), EXACT_VIDEO_LANE, 10, 2),
+        ]
 
-        self.assertIn("capture_group.py", command)
-        self.assertTrue(command.endswith("{*}"))
+        self.assertEqual(exact_video_keeper(items).path, Path("clip.mp4"))
 
-    def test_photo_command_includes_structured_exec_capture_and_exclusions(self) -> None:
+
+class FindDupsOutputTests(unittest.TestCase):
+    def test_quoted_groups_round_trip_shell_special_names(self) -> None:
+        groups = [
+            [r"C:\Mom & Dad's 100% pics\a^b & c.jpg", r"C:\Kids' Photos\ਪੰਜਾਬੀ photo.jpg"],
+            [r"C:\Phone Pics\one photo.jpg", r"C:\Phone Pics\two.jpg", r"C:\x\(1).jpg"],
+        ]
+        output = [" ".join(shlex.quote(path) for path in group) for group in groups]
+
+        self.assertEqual(parse_quoted_groups(output), [[Path(path) for path in group] for group in groups])
+
+    def test_quoted_group_parser_skips_noise_and_duplicates(self) -> None:
+        line = "'C:\\a.jpg' 'C:\\b.jpg'"
+
+        self.assertEqual(parse_quoted_groups(["", line, line, "'unbalanced", "'C:\\single.jpg'"]), [[Path(r"C:\a.jpg"), Path(r"C:\b.jpg")]])
+
+    def test_photo_command_reports_groups_on_stdout_without_a_shell(self) -> None:
         request = ScanRequest(Path(r"C:\Photos"), quarantine_root=Path(r"C:\Photos\quarantine"))
 
-        command = build_photo_scan_command(request, Path("groups.jsonl"), Path("hashes.json"))
+        command = build_photo_scan_command(request, Path("hashes.json"), ["python", "-m", "duplicate_images.duplicate"])
 
-        self.assertIn("--on-equal", command)
-        self.assertIn("exec", command)
-        self.assertIn("--exec", command)
-        self.assertIn(r"^\$RECYCLE\.BIN$", command)
-        self.assertIn(r"^System\ Volume\ Information$", command)
-        self.assertIn(r"^quarantine$", command)
+        self.assertEqual(command[:3], ["python", "-m", "duplicate_images.duplicate"])
+        self.assertEqual(command[-2:], ["--on-equal", "quote"])
+        self.assertNotIn("--exec", command)
+
+    def test_find_dups_runs_as_module_of_current_interpreter(self) -> None:
+        # A venv's find-dups.exe launcher breaks once the project folder moves.
+        self.assertEqual(find_dups_command_prefix(), [sys.executable, "-m", "duplicate_images.duplicate"])
+
+
+class ExcludePatternTests(unittest.TestCase):
+    """find-dups applies re.search() to each file's full parent path."""
+
+    def excluded(self, patterns: tuple[str, ...], parent: Path) -> bool:
+        return any(re.search(pattern, str(parent)) for pattern in patterns)
+
+    def test_internal_quarantine_and_system_folders_are_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary).resolve() / "library"
+            quarantine = source / "library_quarantine"
+            patterns = photo_exclude_patterns(source, quarantine)
+
+            self.assertTrue(self.excluded(patterns, quarantine / "photos" / "album"))
+            self.assertTrue(self.excluded(patterns, source / "$RECYCLE.BIN" / "S-1-5"))
+            self.assertTrue(self.excluded(patterns, source / "System Volume Information"))
+            self.assertFalse(self.excluded(patterns, source / "album"))
+            self.assertFalse(self.excluded(patterns, source / "album" / "library_quarantine_notes"))
+
+    def test_external_quarantine_is_not_a_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary).resolve() / "library"
+
+            patterns = photo_exclude_patterns(source, source.parent / "library_quarantine")
+
+            self.assertEqual(len(patterns), 2)
+
+
+class PhotoGroupTests(unittest.TestCase):
+    def test_matches_split_into_identical_and_similar_groups(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = Image.new("RGB", (64, 64), "#3567e8")
+            original = root / "IMG_1.jpg"
+            copy = root / "IMG_1 - Copy.jpg"
+            resent = root / "WhatsApp Image.jpg"
+            image.save(original)
+            copy.write_bytes(original.read_bytes())
+            image.resize((32, 32)).save(resent)
+
+            groups = build_photo_groups([[copy, original, resent]], DigestCache(root / "digests.json"))
+
+            exact = [group for group in groups if group.exact]
+            similar = [group for group in groups if not group.exact]
+            self.assertEqual(len(exact), 1)
+            self.assertEqual(exact[0].keeper_path, original)
+            self.assertEqual([entry.path for entry in exact[0].duplicates], [copy])
+            self.assertEqual(len(similar), 1)
+            self.assertEqual({entry.path for entry in similar[0].items}, {original, resent})
+            self.assertEqual(similar[0].keeper_path, original)
+            self.assertNotEqual(exact[0].id, similar[0].id)
+
+    def test_similar_only_match_produces_no_exact_group(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = Image.new("RGB", (64, 64), "#3567e8")
+            first, second = root / "0R6A8174.JPG", root / "0R6A8175.JPG"
+            image.save(first, quality=95)
+            image.save(second, quality=60)
+
+            groups = build_photo_groups([[first, second]], DigestCache(root / "digests.json"))
+
+            self.assertEqual([group.exact for group in groups], [False])
+
+    def test_digest_cache_reuses_unchanged_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "a.jpg"
+            path.write_bytes(b"bytes")
+            cache = DigestCache(root / "digests.json")
+            first = cache.digest(path)
+            cache.save()
+
+            with patch("media_sorter.hash_file", side_effect=AssertionError("re-hashed")):
+                self.assertEqual(DigestCache(root / "digests.json").digest(path), first)
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -202,6 +289,70 @@ class QuarantineTests(unittest.TestCase):
 
             self.assertEqual(manifest.entries[0].status, "error")
             self.assertIn("stopped", RunManifest.load(manifest.path).entries[0].error)
+
+    def test_overlapping_groups_never_quarantine_every_copy(self) -> None:
+        # Exact and near video lanes can pick opposite keepers for the same pair.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "library"
+            source.mkdir()
+            first = source / "a.mp4"
+            second = source / "b.mp4"
+            first.write_bytes(b"same")
+            second.write_bytes(b"same")
+            items = [item(first, EXACT_VIDEO_LANE, 4, 1), item(second, EXACT_VIDEO_LANE, 4, 2)]
+            exact = DuplicateGroup("exact", EXACT_VIDEO_LANE, items, first, exact=True)
+            near = DuplicateGroup("near", NEAR_VIDEO_LANE, list(items), second)
+
+            manifest = quarantine_groups(source, root / "quarantine", [exact, near])
+
+            self.assertEqual([entry.status for entry in manifest.entries], ["moved", "skipped"])
+            self.assertTrue(first.exists())
+
+    def test_missing_keeper_skips_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "library"
+            source.mkdir()
+            duplicate = source / "copy.jpg"
+            duplicate.write_text("copy", encoding="utf-8")
+            group = DuplicateGroup("photos-test", PHOTO_LANE, [item(source / "gone.jpg", PHOTO_LANE, 4, 1), item(duplicate, PHOTO_LANE, 4, 2)], source / "gone.jpg")
+
+            manifest = quarantine_groups(source, root / "quarantine", [group])
+
+            self.assertEqual(manifest.entries[0].status, "skipped")
+            self.assertTrue(duplicate.exists())
+
+    def test_interrupted_run_is_recoverable_from_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "library"
+            source.mkdir()
+            kept = source / "kept.jpg"
+            kept.write_text("original", encoding="utf-8")
+            duplicates = []
+            for index in range(3):
+                duplicate = source / f"copy{index}.jpg"
+                duplicate.write_text("copy", encoding="utf-8")
+                duplicates.append(item(duplicate, PHOTO_LANE, 4, 2))
+            group = DuplicateGroup("photos-test", PHOTO_LANE, [item(kept, PHOTO_LANE, 8, 1), *duplicates], kept)
+            moves = []
+
+            def crash_on_third(source_path: str, destination: str) -> None:
+                if len(moves) == 2:
+                    raise KeyboardInterrupt
+                moves.append(destination)
+                os.replace(source_path, destination)
+
+            with self.assertRaises(KeyboardInterrupt):
+                quarantine_groups(source, root / "quarantine", [group], move_file=crash_on_third)
+
+            manifest_file = next((root / "quarantine" / ".duplicate-media-sorter" / "runs").glob("*.json"))
+            recovered = RunManifest.load(manifest_file)
+            self.assertEqual([entry.status for entry in recovered.entries], ["moved", "moved", "pending"])
+            restore_entries(recovered, {entry.id for entry in recovered.entries})
+            self.assertTrue(all((source / f"copy{index}.jpg").exists() for index in range(3)))
+            self.assertEqual(RunManifest.load(manifest_file).entries[0].status, "restored")
 
 
 class VideoTests(unittest.TestCase):

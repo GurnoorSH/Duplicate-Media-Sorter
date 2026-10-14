@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 from collections import defaultdict
 from pathlib import Path
 from string import Template
 
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThread, QThreadPool, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -40,8 +41,10 @@ from media_sorter import (
     EXACT_VIDEO_LANE,
     NEAR_VIDEO_LANE,
     PHOTO_LANE,
+    RESTORABLE_STATUSES,
     DuplicateGroup,
     ManifestEntry,
+    MediaItem,
     RunManifest,
     ScanCancelled,
     ScanProgress,
@@ -51,6 +54,7 @@ from media_sorter import (
     probe_vdf_tools,
     quarantine_groups,
     restore_entries,
+    runs_dir,
     scan_library,
     thumbnail_path,
 )
@@ -61,7 +65,20 @@ LANE_LABELS = {
     EXACT_VIDEO_LANE: "Exact videos",
     NEAR_VIDEO_LANE: "Near videos",
 }
-LANE_ORDER = (PHOTO_LANE, EXACT_VIDEO_LANE, NEAR_VIDEO_LANE)
+# Review categories: (key, label, hint, predicate). Identical copies are
+# pre-selected; anything that only looks alike starts unselected.
+REVIEW_CATEGORIES = (
+    ("photos_exact", "Identical photos", "Byte-for-byte copies. Pre-selected for quarantine.", lambda group: group.lane == PHOTO_LANE and group.exact),
+    (
+        "photos_similar",
+        "Similar photos",
+        "Look alike but differ: burst shots, edits, resized or re-sent copies. Nothing is selected until you choose.",
+        lambda group: group.lane == PHOTO_LANE and not group.exact,
+    ),
+    ("videos_exact", "Exact videos", "Byte-for-byte copies. Pre-selected for quarantine.", lambda group: group.lane == EXACT_VIDEO_LANE),
+    ("videos_near", "Near videos", "Re-encoded or trimmed versions. Nothing is selected until you choose.", lambda group: group.lane == NEAR_VIDEO_LANE),
+)
+GROUPS_PER_PAGE = 20
 
 
 def format_bytes(value: int) -> str:
@@ -79,6 +96,72 @@ def clear_layout(layout: QVBoxLayout | QHBoxLayout) -> None:
         widget = item.widget()
         if widget is not None:
             widget.deleteLater()
+
+
+def page_count(total: int) -> int:
+    return max(1, math.ceil(total / GROUPS_PER_PAGE))
+
+
+def default_selections(groups: list[DuplicateGroup]) -> dict[str, set[str]]:
+    return {group.id: {str(item.path) for item in group.duplicates} if group.exact else set() for group in groups}
+
+
+class Pager(QWidget):
+    """Previous / next controls shared by the review and results pages."""
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.page = 0
+        self.pages = 1
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.previous = QPushButton("Previous")
+        self.previous.clicked.connect(lambda: self.go(self.page - 1))
+        self.label = QLabel()
+        self.label.setObjectName("hint")
+        self.next = QPushButton("Next")
+        self.next.clicked.connect(lambda: self.go(self.page + 1))
+        layout.addWidget(self.previous)
+        layout.addWidget(self.label)
+        layout.addWidget(self.next)
+
+    def reset(self, total: int, page: int = 0) -> None:
+        self.pages = page_count(total)
+        self.page = min(max(page, 0), self.pages - 1)
+        self._refresh()
+
+    def go(self, page: int) -> None:
+        if 0 <= page < self.pages and page != self.page:
+            self.page = page
+            self._refresh()
+            self.changed.emit()
+
+    def bounds(self) -> tuple[int, int]:
+        start = self.page * GROUPS_PER_PAGE
+        return start, start + GROUPS_PER_PAGE
+
+    def _refresh(self) -> None:
+        self.label.setText(f"Page {self.page + 1} of {self.pages}")
+        self.previous.setEnabled(self.page > 0)
+        self.next.setEnabled(self.page < self.pages - 1)
+
+
+class ThumbnailSignals(QObject):
+    ready = Signal(str, str)
+
+
+class ThumbnailTask(QRunnable):
+    def __init__(self, item: MediaItem, size: tuple[int, int], signals: ThumbnailSignals) -> None:
+        super().__init__()
+        self.item = item
+        self.size = size
+        self.signals = signals
+
+    def run(self) -> None:
+        output = thumbnail_path(self.item, self.size)
+        self.signals.ready.emit(str(self.item.path), str(output) if output else "")
 
 
 class ScanWorker(QObject):
@@ -135,8 +218,29 @@ class QuarantineWorker(QObject):
             self.completed.emit(manifest)
 
 
+class RestoreWorker(QObject):
+    progress = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, manifest: RunManifest, entry_ids: set[str]) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.entry_ids = entry_ids
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            restore_entries(self.manifest, self.entry_ids, self.progress.emit)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(self.manifest)
+
+
 class StartPage(QWidget):
     scan_requested = Signal(object)
+    manifest_requested = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -180,12 +284,27 @@ class StartPage(QWidget):
         tool_status.setWordWrap(True)
         card_layout.addWidget(tool_status)
 
+        buttons = QHBoxLayout()
+        restore_button = QPushButton("Restore a Previous Run...")
+        restore_button.setToolTip("Open a quarantine run manifest to review or restore its files.")
+        restore_button.clicked.connect(self._choose_manifest)
         self.scan_button = QPushButton("Scan Library")
         self.scan_button.setObjectName("primaryButton")
         self.scan_button.clicked.connect(self._emit_request)
-        card_layout.addWidget(self.scan_button, alignment=Qt.AlignmentFlag.AlignRight)
+        buttons.addWidget(restore_button)
+        buttons.addStretch()
+        buttons.addWidget(self.scan_button)
+        card_layout.addLayout(buttons)
         layout.addWidget(card)
         layout.addStretch()
+
+    def _choose_manifest(self) -> None:
+        start = Path(self.quarantine_edit.text().strip()) if self.quarantine_edit.text().strip() else Path.home()
+        if runs_dir(start).is_dir():
+            start = runs_dir(start)
+        path, _filter = QFileDialog.getOpenFileName(self, "Open quarantine run", str(start), "Run manifests (*.json)")
+        if path:
+            self.manifest_requested.emit(Path(path))
 
     def _path_row(self, editor: QLineEdit, choose) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -247,6 +366,8 @@ class ProgressPage(QWidget):
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
         self.logs.setPlaceholderText("Scan details will appear here.")
+        # Large libraries emit tens of thousands of progress lines; keep the log bounded.
+        self.logs.document().setMaximumBlockCount(3000)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel_requested)
         layout.addWidget(self.title)
@@ -269,8 +390,13 @@ class ProgressPage(QWidget):
         else:
             self.bar.setRange(0, 100)
             self.bar.setValue(progress.percent)
-        prefix = "Warning: " if progress.warning else ""
-        self.logs.append(prefix + progress.message)
+        counted = progress.current is not None and progress.total
+        if progress.warning or not counted or progress.current % 250 == 0 or progress.current == progress.total:
+            prefix = "Warning: " if progress.warning else ""
+            self.logs.append(prefix + progress.message)
+
+
+THUMBNAIL_SIZE = (190, 122)
 
 
 class MediaTile(QFrame):
@@ -285,22 +411,17 @@ class MediaTile(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(7)
-        preview = QLabel()
-        preview.setFixedSize(190, 122)
-        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setObjectName("preview")
+        self.preview = QLabel()
+        self.preview.setFixedSize(*THUMBNAIL_SIZE)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setObjectName("preview")
         if lane == PHOTO_LANE:
-            thumbnail = thumbnail_path(item, (190, 122))
-            if thumbnail:
-                pixmap = QPixmap(str(thumbnail))
-                preview.setPixmap(pixmap.scaled(preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            else:
-                preview.setText("Preview unavailable")
+            self.preview.setText("Loading preview...")
         else:
-            preview.setText("Video")
-            preview.setCursor(Qt.CursorShape.PointingHandCursor)
-            preview.mousePressEvent = lambda _event: self.preview_requested.emit(self.item.path, self.lane)  # type: ignore[method-assign]
-        layout.addWidget(preview)
+            self.preview.setText("Video")
+            self.preview.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.preview.mousePressEvent = lambda _event: self.preview_requested.emit(self.item.path, self.lane)  # type: ignore[method-assign]
+        layout.addWidget(self.preview)
         name = QLabel(item.path.name)
         name.setToolTip(str(item.path))
         name.setWordWrap(True)
@@ -321,6 +442,13 @@ class MediaTile(QFrame):
             play.clicked.connect(lambda: self.preview_requested.emit(self.item.path, self.lane))
             layout.addWidget(play)
 
+    def set_thumbnail(self, path: str) -> None:
+        pixmap = QPixmap(path) if path else QPixmap()
+        if pixmap.isNull():
+            self.preview.setText("Preview unavailable")
+            return
+        self.preview.setPixmap(pixmap.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
 
 class GroupCard(QFrame):
     selection_changed = Signal(str, object)
@@ -336,9 +464,12 @@ class GroupCard(QFrame):
         heading = QHBoxLayout()
         title = QLabel(f"{len(group.items)} matching files")
         title.setObjectName("groupTitle")
+        kind = QLabel("Identical copies" if group.exact else "Similar, review before moving")
+        kind.setObjectName("pill" if group.exact else "pillWarn")
         reclaim = QLabel(f"{format_bytes(group.reclaimable_bytes)} reclaimable")
         reclaim.setObjectName("pill")
         heading.addWidget(title)
+        heading.addWidget(kind)
         heading.addStretch()
         heading.addWidget(reclaim)
         layout.addLayout(heading)
@@ -364,8 +495,11 @@ class GroupCard(QFrame):
         previous = str(self.group.keeper_path)
         chosen = str(path)
         self.group.set_keeper(path)
+        # Swap roles: the old keeper is only marked to move if the new keeper
+        # was. Similar groups start unselected and should stay that way.
+        was_selected = chosen in self.selected
         self.selected.discard(chosen)
-        if previous != chosen:
+        if previous != chosen and was_selected:
             self.selected.add(previous)
         for tile_path, tile in self.tiles.items():
             is_keeper = tile_path == chosen
@@ -385,11 +519,18 @@ class GroupCard(QFrame):
 
 class ReviewPage(QWidget):
     quarantine_requested = Signal(object)
+    back_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.result: ScanResult | None = None
         self.selections: dict[str, set[str]] = {}
+        self.category = REVIEW_CATEGORIES[0][0]
+        self.visible_tiles: dict[str, list[MediaTile]] = defaultdict(list)
+        self.thumbnail_pool = QThreadPool(self)
+        self.thumbnail_pool.setMaxThreadCount(4)
+        self.thumbnail_signals = ThumbnailSignals()
+        self.thumbnail_signals.ready.connect(self._thumbnail_ready)
         self._build()
 
     def _build(self) -> None:
@@ -400,27 +541,49 @@ class ReviewPage(QWidget):
         title.setObjectName("heroTitle")
         self.summary = QLabel()
         self.summary.setObjectName("subtitle")
+        back = QPushButton("New Scan")
+        back.clicked.connect(self.back_requested)
         quarantine = QPushButton("Quarantine Selected")
         quarantine.setObjectName("primaryButton")
         quarantine.clicked.connect(lambda: self.quarantine_requested.emit(self.selections))
         header.addWidget(title)
         header.addWidget(self.summary)
         header.addStretch()
+        header.addWidget(back)
         header.addWidget(quarantine)
         outer.addLayout(header)
 
         content = QHBoxLayout()
         self.lanes = QListWidget()
-        self.lanes.setFixedWidth(180)
+        self.lanes.setFixedWidth(200)
         self.lanes.currentItemChanged.connect(self._lane_changed)
         content.addWidget(self.lanes)
+
+        middle = QVBoxLayout()
+        self.category_hint = QLabel()
+        self.category_hint.setObjectName("hint")
+        self.category_hint.setWordWrap(True)
+        middle.addWidget(self.category_hint)
+        toolbar = QHBoxLayout()
+        select_all = QPushButton("Select All in Category")
+        select_all.clicked.connect(lambda: self._select_category(True))
+        clear_all = QPushButton("Clear Category")
+        clear_all.clicked.connect(lambda: self._select_category(False))
+        self.pager = Pager()
+        self.pager.changed.connect(self._render_page)
+        toolbar.addWidget(select_all)
+        toolbar.addWidget(clear_all)
+        toolbar.addStretch()
+        toolbar.addWidget(self.pager)
+        middle.addLayout(toolbar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.group_host = QWidget()
         self.group_layout = QVBoxLayout(self.group_host)
         self.group_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll.setWidget(self.group_host)
-        content.addWidget(self.scroll, 1)
+        middle.addWidget(self.scroll, 1)
+        content.addLayout(middle, 1)
         content.addWidget(self._preview_panel())
         outer.addLayout(content, 1)
 
@@ -450,35 +613,84 @@ class ReviewPage(QWidget):
 
     def set_result(self, result: ScanResult) -> None:
         self.result = result
-        self.selections = {group.id: {str(item.path) for item in group.duplicates} for group in result.groups}
-        self.summary.setText(f"{len(result.groups)} groups  |  {format_bytes(sum(group.reclaimable_bytes for group in result.groups))} reclaimable")
+        self.selections = default_selections(result.groups)
+        self.lanes.blockSignals(True)
         self.lanes.clear()
-        for lane in LANE_ORDER:
-            count = len(result.groups_for_lane(lane))
-            item = QListWidgetItem(f"{LANE_LABELS[lane]}  {count}")
-            item.setData(Qt.ItemDataRole.UserRole, lane)
+        for key, label, _hint, predicate in REVIEW_CATEGORIES:
+            count = sum(1 for group in result.groups if predicate(group))
+            item = QListWidgetItem(f"{label}  {count}")
+            item.setData(Qt.ItemDataRole.UserRole, key)
             self.lanes.addItem(item)
         self.lanes.setCurrentRow(0)
+        self.lanes.blockSignals(False)
+        self._lane_changed(self.lanes.currentItem())
+        self._update_summary()
+
+    def category_groups(self) -> list[DuplicateGroup]:
+        if self.result is None:
+            return []
+        predicate = next(entry[3] for entry in REVIEW_CATEGORIES if entry[0] == self.category)
+        return [group for group in self.result.groups if predicate(group)]
 
     def _lane_changed(self, current: QListWidgetItem | None) -> None:
-        clear_layout(self.group_layout)
         if self.result is None or current is None:
             return
-        lane = current.data(Qt.ItemDataRole.UserRole)
-        groups = self.result.groups_for_lane(lane)
+        self.category = current.data(Qt.ItemDataRole.UserRole)
+        self.category_hint.setText(next(entry[2] for entry in REVIEW_CATEGORIES if entry[0] == self.category))
+        self.pager.reset(len(self.category_groups()))
+        self._render_page()
+
+    def _render_page(self) -> None:
+        self.thumbnail_pool.clear()
+        self.visible_tiles.clear()
+        clear_layout(self.group_layout)
+        groups = self.category_groups()
         if not groups:
             empty = QLabel("No duplicate groups in this category.")
             empty.setObjectName("subtitle")
             self.group_layout.addWidget(empty)
             return
-        for group in groups:
+        start, end = self.pager.bounds()
+        for group in groups[start:end]:
             card = GroupCard(group, self.selections[group.id])
             card.selection_changed.connect(self._selection_changed)
             card.preview_requested.connect(self.preview_video)
             self.group_layout.addWidget(card)
+            if group.lane == PHOTO_LANE:
+                for tile in card.tiles.values():
+                    self.visible_tiles[str(tile.item.path)].append(tile)
+                    self.thumbnail_pool.start(ThumbnailTask(tile.item, THUMBNAIL_SIZE, self.thumbnail_signals))
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def _thumbnail_ready(self, item_path: str, thumbnail: str) -> None:
+        for tile in self.visible_tiles.get(item_path, []):
+            tile.set_thumbnail(thumbnail)
+
+    def _select_category(self, selected: bool) -> None:
+        for group in self.category_groups():
+            self.selections[group.id] = {str(item.path) for item in group.duplicates} if selected else set()
+        self._render_page()
+        self._update_summary()
 
     def _selection_changed(self, group_id: str, selected: set[str]) -> None:
         self.selections[group_id] = selected
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        if self.result is None:
+            return
+        files = 0
+        size = 0
+        for group in self.result.groups:
+            chosen = self.selections.get(group.id, set())
+            for item in group.items:
+                if str(item.path) in chosen:
+                    files += 1
+                    size += item.size
+        text = f"{len(self.result.groups)} groups  |  {files} files selected ({format_bytes(size)})"
+        if self.result.warnings:
+            text += f"  |  {len(self.result.warnings)} files could not be read"
+        self.summary.setText(text)
 
     def preview_video(self, path: Path, _lane: str) -> None:
         self.preview_name.setText(str(path))
@@ -494,17 +706,17 @@ class ReviewPage(QWidget):
 
 class ManifestGroupCard(QFrame):
     restore_group = Signal(object)
+    check_changed = Signal(str, bool)
 
-    def __init__(self, group_id: str, entries: list[ManifestEntry]) -> None:
+    def __init__(self, group_id: str, entries: list[ManifestEntry], checked: set[str]) -> None:
         super().__init__()
         self.setObjectName("card")
-        self.checkboxes: dict[str, QCheckBox] = {}
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
         header.addWidget(QLabel(f"{LANE_LABELS.get(entries[0].lane, entries[0].lane)} group"))
         header.addStretch()
         restore = QPushButton("Restore Group")
-        restore.clicked.connect(lambda: self.restore_group.emit({entry.id for entry in entries if entry.status in ("moved", "restore-blocked")}))
+        restore.clicked.connect(lambda: self.restore_group.emit({entry.id for entry in entries if entry.status in RESTORABLE_STATUSES}))
         header.addWidget(restore)
         layout.addLayout(header)
         keeper = QLabel(f"Original kept: {entries[0].keeper_path}")
@@ -512,21 +724,28 @@ class ManifestGroupCard(QFrame):
         keeper.setObjectName("hint")
         layout.addWidget(keeper)
         for entry in entries:
-            checkbox = QCheckBox(f"{entry.status}: {entry.moved_path}")
-            checkbox.setToolTip(f"Restore to: {entry.original_path}")
-            checkbox.setEnabled(entry.status in ("moved", "restore-blocked"))
+            location = entry.moved_path or entry.original_path
+            checkbox = QCheckBox(f"{entry.status}: {location}")
+            tooltip = f"Restore to: {entry.original_path}"
+            if entry.error:
+                tooltip += f"\n{entry.error}"
+            checkbox.setToolTip(tooltip)
+            checkbox.setEnabled(entry.status in RESTORABLE_STATUSES)
+            checkbox.setChecked(entry.id in checked)
+            checkbox.toggled.connect(lambda state, entry_id=entry.id: self.check_changed.emit(entry_id, state))
             layout.addWidget(checkbox)
-            self.checkboxes[entry.id] = checkbox
 
 
 class ResultsPage(QWidget):
     restore_requested = Signal(object)
     open_folder_requested = Signal()
+    new_scan_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.manifest: RunManifest | None = None
-        self.cards: list[ManifestGroupCard] = []
+        self.groups: list[tuple[str, list[ManifestEntry]]] = []
+        self.checked: set[str] = set()
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 24)
         header = QHBoxLayout()
@@ -534,49 +753,71 @@ class ResultsPage(QWidget):
         title.setObjectName("heroTitle")
         self.summary = QLabel()
         self.summary.setObjectName("subtitle")
-        restore = QPushButton("Restore Selected")
-        restore.clicked.connect(self._restore_selected)
+        new_scan = QPushButton("New Scan")
+        new_scan.clicked.connect(self.new_scan_requested)
         open_folder = QPushButton("Open Folder")
         open_folder.clicked.connect(self.open_folder_requested)
+        restore_all = QPushButton("Restore All")
+        restore_all.clicked.connect(self._restore_all)
+        restore = QPushButton("Restore Selected")
+        restore.clicked.connect(lambda: self.restore_requested.emit(set(self.checked)))
         header.addWidget(title)
         header.addWidget(self.summary)
         header.addStretch()
+        header.addWidget(new_scan)
         header.addWidget(open_folder)
+        header.addWidget(restore_all)
         header.addWidget(restore)
         outer.addLayout(header)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        self.pager = Pager()
+        self.pager.changed.connect(self._render_page)
+        outer.addWidget(self.pager, alignment=Qt.AlignmentFlag.AlignRight)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
         host = QWidget()
         self.card_layout = QVBoxLayout(host)
         self.card_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll.setWidget(host)
-        outer.addWidget(scroll, 1)
+        self.scroll.setWidget(host)
+        outer.addWidget(self.scroll, 1)
 
     def set_manifest(self, manifest: RunManifest) -> None:
         self.manifest = manifest
-        clear_layout(self.card_layout)
-        self.cards = []
-        moved = sum(entry.status == "moved" for entry in manifest.entries)
-        self.summary.setText(f"{moved} files currently quarantined")
-        groups: dict[str, list[ManifestEntry]] = defaultdict(list)
+        self.checked.clear()
+        statuses = [entry.status for entry in manifest.entries]
+        parts = [f"{statuses.count('moved')} files currently quarantined"]
+        for status in ("restored", "skipped", "error"):
+            if statuses.count(status):
+                parts.append(f"{statuses.count(status)} {status}")
+        self.summary.setText("  |  ".join(parts))
+        grouped: dict[str, list[ManifestEntry]] = defaultdict(list)
         for entry in manifest.entries:
-            groups[entry.group_id].append(entry)
-        if not groups:
-            self.card_layout.addWidget(QLabel("No files were moved."))
-        for group_id, entries in groups.items():
-            card = ManifestGroupCard(group_id, entries)
-            card.restore_group.connect(self.restore_requested)
-            self.card_layout.addWidget(card)
-            self.cards.append(card)
+            grouped[entry.group_id].append(entry)
+        self.groups = list(grouped.items())
+        self.pager.reset(len(self.groups), self.pager.page)
+        self._render_page()
 
-    def _restore_selected(self) -> None:
-        selected = {
-            entry_id
-            for card in self.cards
-            for entry_id, checkbox in card.checkboxes.items()
-            if checkbox.isChecked()
-        }
-        self.restore_requested.emit(selected)
+    def _render_page(self) -> None:
+        clear_layout(self.card_layout)
+        if not self.groups:
+            self.card_layout.addWidget(QLabel("No files were moved."))
+            return
+        start, end = self.pager.bounds()
+        for group_id, entries in self.groups[start:end]:
+            card = ManifestGroupCard(group_id, entries, self.checked)
+            card.restore_group.connect(self.restore_requested)
+            card.check_changed.connect(self._check_changed)
+            self.card_layout.addWidget(card)
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def _check_changed(self, entry_id: str, checked: bool) -> None:
+        if checked:
+            self.checked.add(entry_id)
+        else:
+            self.checked.discard(entry_id)
+
+    def _restore_all(self) -> None:
+        if self.manifest is not None:
+            self.restore_requested.emit({entry.id for entry in self.manifest.entries if entry.status in RESTORABLE_STATUSES})
 
 
 class MainWindow(QMainWindow):
@@ -598,11 +839,15 @@ class MainWindow(QMainWindow):
         self.worker: QObject | None = None
         self.scan_result: ScanResult | None = None
         self.manifest: RunManifest | None = None
+        self.restoring_ids: set[str] = set()
         self.start_page.scan_requested.connect(self.start_scan)
+        self.start_page.manifest_requested.connect(self.open_manifest)
         self.progress_page.cancel_requested.connect(self.cancel_scan)
         self.review_page.quarantine_requested.connect(self.start_quarantine)
+        self.review_page.back_requested.connect(self.show_start)
         self.results_page.restore_requested.connect(self.restore)
         self.results_page.open_folder_requested.connect(self.open_quarantine_folder)
+        self.results_page.new_scan_requested.connect(self.show_start)
         self._build_theme_menu()
         self.apply_theme()
 
@@ -697,17 +942,48 @@ class MainWindow(QMainWindow):
         self._finish_worker()
         self.pages.setCurrentWidget(self.start_page)
 
+    def show_start(self) -> None:
+        self.review_page.player.stop()
+        self.pages.setCurrentWidget(self.start_page)
+
+    def open_manifest(self, path: Path) -> None:
+        try:
+            manifest = RunManifest.load(path)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            QMessageBox.critical(self, "Could not open run", f"{path}\n\n{exc}")
+            return
+        self.manifest = manifest
+        self.results_page.set_manifest(manifest)
+        self.pages.setCurrentWidget(self.results_page)
+
     def restore(self, entry_ids: set[str]) -> None:
         if self.manifest is None or not entry_ids:
             return
         response = QMessageBox.question(self, "Restore selected files?", f"Restore {len(entry_ids)} selected files to their original paths?")
         if response != QMessageBox.StandardButton.Yes:
             return
-        restore_entries(self.manifest, entry_ids)
-        self.results_page.set_manifest(self.manifest)
-        blocked = [entry.error for entry in self.manifest.entries if entry.id in entry_ids and entry.status in ("restore-blocked", "error", "missing")]
+        self.progress_page.reset("Restoring files", cancellable=False)
+        self.pages.setCurrentWidget(self.progress_page)
+        self.restoring_ids = set(entry_ids)
+        worker = RestoreWorker(self.manifest, entry_ids)
+        # Bound methods (not lambdas) so Qt queues the call onto the GUI thread.
+        worker.completed.connect(self.restore_completed)
+        worker.failed.connect(self.operation_failed)
+        self._start_worker(worker)
+
+    def restore_completed(self, manifest: RunManifest) -> None:
+        self._finish_worker()
+        self.results_page.set_manifest(manifest)
+        self.pages.setCurrentWidget(self.results_page)
+        blocked = [
+            entry.error
+            for entry in manifest.entries
+            if entry.id in self.restoring_ids and entry.status in ("restore-blocked", "restore-error", "missing")
+        ]
         if blocked:
-            QMessageBox.warning(self, "Some files could not be restored", "\n".join(error for error in blocked if error))
+            shown = "\n".join(error for error in blocked[:20] if error)
+            more = f"\n...and {len(blocked) - 20} more" if len(blocked) > 20 else ""
+            QMessageBox.warning(self, f"{len(blocked)} files could not be restored", shown + more)
 
     def open_quarantine_folder(self) -> None:
         if self.manifest is not None:
@@ -719,8 +995,8 @@ class MainWindow(QMainWindow):
             self.progress_page.message.setText("Cancelling scan...")
             event.ignore()
             return
-        if isinstance(self.worker, QuarantineWorker):
-            QMessageBox.information(self, "Quarantine in progress", "Wait for the quarantine move to finish before closing the app.")
+        if isinstance(self.worker, (QuarantineWorker, RestoreWorker)):
+            QMessageBox.information(self, "Files are moving", "Wait for the current move to finish before closing the app.")
             event.ignore()
             return
         self.review_page.player.stop()
@@ -748,6 +1024,8 @@ THEMES = {
         "menu_hover": "#eef4ff",
         "tooltip_bg": "#172033",
         "tooltip_text": "#ffffff",
+        "warn_soft": "#fff4e5",
+        "warn_text": "#b54708",
     },
     "dark": {
         "app_bg": "#101622",
@@ -769,6 +1047,8 @@ THEMES = {
         "menu_hover": "#22304a",
         "tooltip_bg": "#e6edf7",
         "tooltip_text": "#101622",
+        "warn_soft": "#3d2a12",
+        "warn_text": "#fdb022",
     },
 }
 
@@ -803,6 +1083,12 @@ QLabel#groupTitle {
 QLabel#pill {
     color: $accent_text;
     background: $accent_soft;
+    border-radius: 8px;
+    padding: 4px 8px;
+}
+QLabel#pillWarn {
+    color: $warn_text;
+    background: $warn_soft;
     border-radius: 8px;
     padding: 4px 8px;
 }

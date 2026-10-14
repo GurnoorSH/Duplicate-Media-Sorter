@@ -2,9 +2,11 @@
 """
 Safety-first wrapper around duplicate_images' find-dups command.
 
-The wrapper keeps the expensive image hashing cache stable across runs, uses
-grouped duplicate handling, and maps the three intended operating stages to the
-find-dups actions described in the project spec.
+find-dups computes and caches perceptual hashes and reports matching groups.
+The wrapper then splits each match into byte-identical copies and merely
+similar images, keeps the best copy, and only acts on identical copies unless
+``--include-similar`` is given. Quarantine runs write the same restorable
+manifest as the desktop app.
 """
 
 from __future__ import annotations
@@ -12,12 +14,13 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
+
+import media_sorter
 
 
 ALGORITHMS = (
@@ -63,6 +66,7 @@ class DedupConfig:
     max_image_pixels: int | None = None
     yes: bool = False
     print_command_only: bool = False
+    include_similar: bool = False
 
 
 def positive_int(raw_value: str) -> int:
@@ -106,10 +110,18 @@ def default_quarantine_dir(target: Path) -> Path:
     return target.parent / f"{target_name}_quarantine"
 
 
-def build_find_dups_command(config: DedupConfig) -> list[str]:
+def digest_cache_path(cache: Path) -> Path:
+    return cache.with_name(f"{cache.stem}_digests.json")
+
+
+def build_find_dups_command(config: DedupConfig, find_dups: Sequence[str] | None = None) -> list[str]:
+    """Build the hashing command. find-dups only reports groups; this script
+    performs every move or delete itself."""
+    if config.mode not in MODES:
+        raise ValueError(f"unsupported mode: {config.mode}")
     cache = normalize_cache_path(config.cache)
     cmd = [
-        config.find_dups_executable,
+        *(find_dups or [config.find_dups_executable]),
         str(config.target),
     ]
 
@@ -140,26 +152,9 @@ def build_find_dups_command(config: DedupConfig) -> list[str]:
     if config.max_image_pixels is not None:
         cmd.extend(["--max-image-pixels", str(config.max_image_pixels)])
 
-    if config.mode == "dry-run":
-        cmd.extend(["--on-equal", "print"])
-    elif config.mode == "quarantine":
-        quarantine_dir = config.quarantine_dir
-        if quarantine_dir is None:
-            quarantine_dir = default_quarantine_dir(config.target)
-        cmd.extend(
-            [
-                "--on-equal",
-                "move-smallest",
-                "--move-to",
-                str(quarantine_dir),
-                "--move-recreate-path",
-            ]
-        )
-    elif config.mode == "delete":
-        cmd.extend(["--on-equal", "delete-smallest"])
-    else:
-        raise ValueError(f"unsupported mode: {config.mode}")
-
+    # find-dups' own move/delete actions only touch one file per group and
+    # cannot tell identical copies from similar shots, so it just reports.
+    cmd.extend(["--on-equal", "quote"])
     return cmd
 
 
@@ -215,22 +210,9 @@ def write_heif_bootstrap(runtime_dir: Path) -> Path:
     return runtime_dir.resolve()
 
 
-def env_with_pythonpath(extra_path: Path | None) -> dict[str, str] | None:
-    if extra_path is None:
-        return None
-
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    if existing_pythonpath:
-        env["PYTHONPATH"] = f"{extra_path}{os.pathsep}{existing_pythonpath}"
-    else:
-        env["PYTHONPATH"] = str(extra_path)
-    return env
-
-
-def confirm_delete(target: Path) -> None:
+def confirm_delete(target: Path, count: int) -> None:
     response = input(
-        "WARNING: delete mode permanently removes smaller duplicate files under "
+        f"WARNING: delete mode permanently removes {count} duplicate files under "
         f"'{target}'. Type DELETE to continue: "
     )
     if response.strip() != "DELETE":
@@ -238,11 +220,11 @@ def confirm_delete(target: Path) -> None:
         raise SystemExit(0)
 
 
-def validate_environment(config: DedupConfig) -> tuple[Path, dict[str, str] | None]:
-    find_dups_path = shutil.which(config.find_dups_executable)
-    if find_dups_path is None:
+def validate_environment(config: DedupConfig) -> tuple[list[str], dict[str, str]]:
+    find_dups = media_sorter.find_dups_command_prefix(config.find_dups_executable)
+    if find_dups is None:
         raise RuntimeError(
-            f"Could not find '{config.find_dups_executable}' on PATH. "
+            f"Could not find '{config.find_dups_executable}'. "
             "Install dependencies with: python -m pip install -r requirements.txt"
         )
 
@@ -255,52 +237,122 @@ def validate_environment(config: DedupConfig) -> tuple[Path, dict[str, str] | No
     heif_bootstrap_dir: Path | None = None
     if heic_examples:
         ensure_heif_support(required=True)
-        heif_bootstrap_dir = write_heif_bootstrap(Path(".dedup_runtime"))
+        heif_bootstrap_dir = write_heif_bootstrap(Path(__file__).with_name(".dedup_runtime"))
         sample = ", ".join(str(path) for path in heic_examples[:3])
         print(f"HEIC support enabled for find-dups subprocess. Found examples: {sample}", flush=True)
 
-    if config.mode == "quarantine":
-        quarantine_dir = config.quarantine_dir or default_quarantine_dir(config.target)
-        quarantine_dir.mkdir(parents=True, exist_ok=True)
+    return find_dups, media_sorter.find_dups_environment(heif_bootstrap_dir)
 
-    return Path(find_dups_path), env_with_pythonpath(heif_bootstrap_dir)
+
+def format_size(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+
+def print_report(groups: Sequence[media_sorter.DuplicateGroup], include_similar: bool) -> None:
+    for index, group in enumerate(groups, start=1):
+        kind = "IDENTICAL" if group.exact else "SIMILAR, review"
+        print(f"\nGroup {index} [{kind}]: {len(group.items)} files, {format_size(group.reclaimable_bytes)} reclaimable")
+        print(f"KEEP {group.keeper_path}")
+        verb = "MOVE" if group.exact or include_similar else "LOOK"
+        for item in group.duplicates:
+            print(f"{verb} {item.path}")
+
+    exact = [group for group in groups if group.exact]
+    similar = [group for group in groups if not group.exact]
+    for label, chosen in (("Identical", exact), ("Similar", similar)):
+        files = sum(len(group.duplicates) for group in chosen)
+        size = sum(group.reclaimable_bytes for group in chosen)
+        print(f"{label} groups: {len(chosen)} ({files} extra files, {format_size(size)})")
+    if similar and not include_similar:
+        print("Similar groups are reported only. Review them in the desktop app, or pass --include-similar to act on them.")
+
+
+def print_progress(progress: media_sorter.ScanProgress) -> None:
+    if progress.warning:
+        print(f"Warning: {progress.message}", file=sys.stderr, flush=True)
+    elif progress.current is not None and progress.total and (progress.current % 1000 == 0 or progress.current == progress.total):
+        print(f"{progress.message} ({progress.current}/{progress.total})", file=sys.stderr, flush=True)
+
+
+def delete_duplicates(groups: Sequence[media_sorter.DuplicateGroup]) -> tuple[int, int]:
+    deleted = failed = 0
+    for group in groups:
+        if not group.keeper_path.exists():
+            print(f"Skipping group: kept original is missing: {group.keeper_path}", file=sys.stderr)
+            continue
+        for item in group.duplicates:
+            try:
+                item.path.unlink()
+            except OSError as exc:
+                failed += 1
+                print(f"Could not delete {item.path}: {exc}", file=sys.stderr)
+            else:
+                deleted += 1
+                print(f"Deleted {item.path}")
+    return deleted, failed
 
 
 def run_deduplication(config: DedupConfig) -> int:
-    find_dups_path, env = validate_environment(config)
-    executable_config = DedupConfig(
-        **{
-            **config.__dict__,
-            "find_dups_executable": str(find_dups_path),
-        }
-    )
-    cmd = build_find_dups_command(executable_config)
+    find_dups, env = validate_environment(config)
+    cmd = build_find_dups_command(config, find_dups)
+    cache = normalize_cache_path(config.cache)
+    quarantine_dir = (config.quarantine_dir or default_quarantine_dir(config.target)).resolve()
 
-    cache_state = "reusing" if normalize_cache_path(config.cache).exists() else "creating"
     print(f"Mode: {config.mode}", flush=True)
-    print(f"Hash cache: {normalize_cache_path(config.cache)} ({cache_state})", flush=True)
+    print(f"Hash cache: {cache} ({'reusing' if cache.exists() else 'creating'})", flush=True)
     if config.mode == "quarantine":
-        quarantine_dir = config.quarantine_dir or default_quarantine_dir(config.target)
         print(f"Quarantine: {quarantine_dir}", flush=True)
     print(f"Executing: {shell_display(cmd)}", flush=True)
 
     if config.print_command_only:
         return 0
 
-    if config.mode == "delete" and not config.yes:
-        confirm_delete(config.target)
-
-    result = subprocess.run(cmd, check=False, env=env)
+    # stdout carries the matched groups; progress and warnings stay on stderr.
+    result = subprocess.run(cmd, check=False, env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         print(
             "find-dups exited with an error. Review the output above for unreadable "
-            "or corrupted image paths; other files may still have been processed "
-            "before the failure.",
+            "or corrupted image paths.",
             file=sys.stderr,
         )
-    else:
-        print("Deduplication stage completed successfully.")
-    return result.returncode
+        return result.returncode
+
+    captured = [
+        paths
+        for paths in (
+            [path for path in group if not media_sorter.is_within(path, quarantine_dir)]
+            for group in media_sorter.parse_quoted_groups(result.stdout.splitlines())
+        )
+        if len(paths) > 1
+    ]
+    groups = media_sorter.build_photo_groups(captured, media_sorter.DigestCache(digest_cache_path(cache)), print_progress)
+    print_report(groups, config.include_similar)
+    selected = [group for group in groups if group.exact or config.include_similar]
+    file_count = sum(len(group.duplicates) for group in selected)
+
+    if config.mode == "dry-run":
+        print("Dry run complete. No files were moved or deleted.")
+        return 0
+
+    if config.mode == "quarantine":
+        manifest = media_sorter.quarantine_groups(config.target.resolve(), quarantine_dir, selected, callback=print_progress)
+        statuses = [entry.status for entry in manifest.entries]
+        print(
+            f"Moved {statuses.count('moved')} files, skipped {statuses.count('skipped')}, "
+            f"failed {statuses.count('error')}. Restore manifest: {manifest.path}"
+        )
+        return 1 if statuses.count("error") else 0
+
+    if not config.yes:
+        confirm_delete(config.target, file_count)
+    deleted, failed = delete_duplicates(selected)
+    print(f"Deleted {deleted} files, failed {failed}.")
+    return 1 if failed else 0
 
 
 def parse_args(argv: Sequence[str] | None = None) -> DedupConfig:
@@ -358,6 +410,12 @@ def parse_args(argv: Sequence[str] | None = None) -> DedupConfig:
         action="store_true",
         help="Validate inputs and print the find-dups command without running it.",
     )
+    parser.add_argument(
+        "--include-similar",
+        action="store_true",
+        help="Also act on similar (not byte-identical) groups, keeping the highest-resolution image. "
+        "These include burst shots and edits; review them first.",
+    )
 
     args = parser.parse_args(argv)
     if args.no_parallel and args.parallel_workers is not None:
@@ -370,16 +428,14 @@ def parse_args(argv: Sequence[str] | None = None) -> DedupConfig:
 
     quarantine_dir = args.quarantine_dir.expanduser() if args.quarantine_dir is not None else None
     exclude_dirs: list[str] = list(args.exclude_dir)
-    if args.mode == "quarantine":
-        effective_quarantine_dir = quarantine_dir or default_quarantine_dir(args.target)
-        if path_is_relative_to(effective_quarantine_dir, args.target):
-            pattern = re.escape(effective_quarantine_dir.name)
-            if pattern not in exclude_dirs:
-                exclude_dirs.append(pattern)
-            print(
-                "Warning: quarantine directory is inside the target tree; "
-                f"excluding subfolders matching {pattern!r}."
-            )
+    effective_quarantine_dir = quarantine_dir or default_quarantine_dir(args.target)
+    if path_is_relative_to(effective_quarantine_dir, args.target):
+        # find-dups searches each file's full parent path, so anchor on the
+        # absolute quarantine path rather than its folder name.
+        pattern = rf"(?i)^{re.escape(str(effective_quarantine_dir.resolve()))}(?:[\\/]|$)"
+        if pattern not in exclude_dirs:
+            exclude_dirs.append(pattern)
+        print("Warning: quarantine directory is inside the target tree; excluding it from the scan.")
 
     return DedupConfig(
         target=args.target,
@@ -396,6 +452,7 @@ def parse_args(argv: Sequence[str] | None = None) -> DedupConfig:
         max_image_pixels=args.max_image_pixels,
         yes=args.yes,
         print_command_only=args.print_command_only,
+        include_similar=args.include_similar,
     )
 
 
