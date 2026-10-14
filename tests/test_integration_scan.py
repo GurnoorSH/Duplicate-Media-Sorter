@@ -64,6 +64,31 @@ class CommandLineQuarantineTests(unittest.TestCase):
             manifest = RunManifest.load(next((root / "Pics_quarantine" / ".duplicate-media-sorter" / "runs").glob("*.json")))
             self.assertEqual([entry.status for entry in manifest.entries], ["moved", "moved"])
 
+    def test_photo_cli_quarantines_identical_damaged_copies(self) -> None:
+        from PIL import Image
+
+        import dedup_manager
+        from media_sorter import RunManifest
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / "Pics"
+            (source / "dad" / "Camera").mkdir(parents=True)
+            (source / "mom" / "Sd Card").mkdir(parents=True)
+            Image.new("RGB", (256, 256), "#3567e8").save(root / "whole.jpg", quality=95)
+            whole = (root / "whole.jpg").read_bytes()
+            damaged = whole[: len(whole) // 2]  # Truncated: find-dups cannot decode it.
+            (source / "dad" / "Camera" / "IMG_1.jpg").write_bytes(damaged)
+            (source / "mom" / "Sd Card" / "IMG_1.jpg").write_bytes(damaged)
+
+            code = dedup_manager.main([str(source), "--mode", "quarantine", "--cache", str(root / "hashes.json"), "--no-progress"])
+
+            self.assertEqual(code, 0)
+            remaining = [path for path in source.rglob("*.jpg")]
+            self.assertEqual(len(remaining), 1)
+            manifest = RunManifest.load(next((root / "Pics_quarantine" / ".duplicate-media-sorter" / "runs").glob("*.json")))
+            self.assertEqual([entry.status for entry in manifest.entries], ["moved"])
+
     def test_video_cli_writes_restorable_manifest(self) -> None:
         import video_exact_dedup
         from media_sorter import RunManifest, restore_entries

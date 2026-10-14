@@ -11,6 +11,9 @@ interface for reviewing groups before anything moves:
   then split into **identical copies** (same bytes, verified with SHA-256) and
   **similar images** (burst shots, edits, resized or re-sent copies). Only
   identical copies are acted on by default; similar groups need review.
+  Photos that `find-dups` cannot decode (truncated or corrupt files, which it
+  skips with a warning or ignores entirely) are still compared by size and
+  SHA-256, so identical damaged copies are caught too.
 - Videos: exact byte-for-byte duplicate detection through
   `video_exact_dedup.py`, plus near-duplicate detection through Video Duplicate
   Finder (VDF).

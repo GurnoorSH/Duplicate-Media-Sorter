@@ -171,6 +171,51 @@ class PhotoGroupTests(unittest.TestCase):
 
             self.assertEqual([group.exact for group in groups], [False])
 
+    def test_identical_damaged_photos_outside_matches_are_grouped(self) -> None:
+        # find-dups skips images it cannot decode, so identical damaged copies
+        # never reach the perceptual groups; they must still be caught.
+        from PIL import Image
+
+        from media_sorter import exact_groups_outside_matches
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "dad" / "Camera").mkdir(parents=True)
+            (root / "mom" / "Sd Card").mkdir(parents=True)
+            buffer = root / "source.jpg"
+            Image.new("RGB", (64, 64), "#3567e8").save(buffer)
+            damaged = buffer.read_bytes()[: len(buffer.read_bytes()) // 2] + bytes(4096)
+            buffer.unlink()
+            first = root / "dad" / "Camera" / "IMG_1.jpg"
+            second = root / "mom" / "Sd Card" / "IMG_1.jpg"
+            first.write_bytes(damaged)
+            second.write_bytes(damaged)
+            same_size_other = root / "other.jpg"
+            same_size_other.write_bytes(damaged[:-1] + b"\x01")
+            matched = root / "matched.jpg"
+            matched.write_bytes(damaged)
+
+            groups = exact_groups_outside_matches(root, [matched], DigestCache(root / "digests.json"))
+
+            self.assertEqual(len(groups), 1)
+            self.assertTrue(groups[0].exact)
+            self.assertEqual({entry.path for entry in groups[0].items}, {first, second})
+
+    def test_outside_match_check_honours_exclusions(self) -> None:
+        from media_sorter import exact_groups_outside_matches
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "library"
+            quarantine = root / "library_quarantine"
+            quarantine.mkdir(parents=True)
+            (root / "a.jpg").write_bytes(b"damaged bytes")
+            (quarantine / "a.jpg").write_bytes(b"damaged bytes")
+            (root / "notes.txt").write_bytes(b"damaged bytes")
+
+            groups = exact_groups_outside_matches(root, [], DigestCache(root.parent / "digests.json"), photo_exclude_patterns(root, quarantine))
+
+            self.assertEqual(groups, [])
+
     def test_digest_cache_reuses_unchanged_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

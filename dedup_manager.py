@@ -330,7 +330,12 @@ def run_deduplication(config: DedupConfig) -> int:
         )
         if len(paths) > 1
     ]
-    groups = media_sorter.build_photo_groups(captured, media_sorter.DigestCache(digest_cache_path(cache)), print_progress)
+    digests = media_sorter.DigestCache(digest_cache_path(cache))
+    groups = media_sorter.build_photo_groups(captured, digests, print_progress)
+    # Damaged images never appear in find-dups groups; check them byte-for-byte.
+    exclude = [*config.exclude_dirs, *media_sorter.photo_exclude_patterns(config.target, quarantine_dir)]
+    matched = [path for paths in captured for path in paths]
+    groups.extend(media_sorter.exact_groups_outside_matches(config.target, matched, digests, exclude, print_progress))
     print_report(groups, config.include_similar)
     selected = [group for group in groups if group.exact or config.include_similar]
     file_count = sum(len(group.duplicates) for group in selected)

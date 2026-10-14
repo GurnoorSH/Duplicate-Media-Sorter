@@ -48,6 +48,7 @@ FIND_DUPS_MODULE = "duplicate_images.duplicate"
 COPY_NAME_PATTERN = re.compile(r"(?:\s*-\s*copy(?:\s*\(\d+\))?|\s*\(\d+\)|[\s_]copy|__duplicate_\d+)$", re.IGNORECASE)
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 PATH_SEPARATOR_PATTERN = r"[\\/]"
+PHOTO_EXTENSIONS = frozenset({".jpg", ".jpeg", ".jpe", ".png", ".heic", ".heif", ".hif", ".webp", ".gif", ".bmp", ".tif", ".tiff"})
 PHOTO_LANE = "photos"
 EXACT_VIDEO_LANE = "videos_exact"
 NEAR_VIDEO_LANE = "videos_near"
@@ -660,6 +661,72 @@ def build_photo_groups(
     return groups
 
 
+def iter_photo_files(root: Path, exclude_patterns: Sequence[str] = ()) -> Iterable[Path]:
+    """Photo files under root, skipping folders whose path matches an exclude
+    regex (searched against the full folder path, as find-dups does)."""
+    compiled = [re.compile(pattern) for pattern in exclude_patterns]
+    for directory, _dirs, files in os.walk(root):
+        if any(pattern.search(directory) for pattern in compiled):
+            continue
+        for name in files:
+            if os.path.splitext(name)[1].lower() in PHOTO_EXTENSIONS:
+                yield Path(directory, name)
+
+
+def exact_groups_outside_matches(
+    root: Path,
+    matched: Iterable[Path],
+    digests: DigestCache,
+    exclude_patterns: Sequence[str] = (),
+    callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[DuplicateGroup]:
+    """Byte-identical photos that the perceptual pass never grouped.
+
+    find-dups only reports images it can decode, so damaged files (truncated
+    or corrupt JPEGs) never reach the identical-copy check. Every other photo
+    is compared by size, then by SHA-256 where sizes collide.
+    """
+    seen = {path_key(path) for path in matched}
+    by_size: dict[int, list[Path]] = defaultdict(list)
+    for path in iter_photo_files(root, exclude_patterns):
+        if path_key(path) in seen:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size:
+            by_size[size].append(path)
+
+    candidates = [paths for paths in by_size.values() if len(paths) > 1]
+    total = sum(len(paths) for paths in candidates)
+    current = 0
+    groups: list[DuplicateGroup] = []
+    for paths in candidates:
+        by_digest: dict[str, list[Path]] = defaultdict(list)
+        for path in paths:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled("scan cancelled")
+            current += 1
+            emit(callback, ScanProgress("photo_exact", f"Checking unmatched photo: {path.name}", current, total, percent(current, total)))
+            try:
+                by_digest[digests.digest(path)].append(path)
+            except OSError as exc:
+                emit(callback, ScanProgress("photo_exact", f"Could not read {path}: {exc}", warning=True))
+        for copies in by_digest.values():
+            if len(copies) < 2:
+                continue
+            try:
+                items = [photo_item(path) for path in copies]
+            except OSError:
+                continue
+            keeper = photo_keeper(items)
+            groups.append(DuplicateGroup(group_id(PHOTO_LANE, copies, "exact"), PHOTO_LANE, items, keeper.path, exact=True))
+    digests.save()
+    return groups
+
+
 def scan_photos(
     request: ScanRequest,
     callback: ProgressCallback | None = None,
@@ -700,7 +767,12 @@ def scan_photos(
         kept = [path for path in paths if not is_within(path, quarantine_root)]
         if len(kept) > 1:
             captured.append(kept)
-    return build_photo_groups(captured, DigestCache(workspace / "photo_digests.json"), callback, cancel_event)
+    digests = DigestCache(workspace / "photo_digests.json")
+    groups = build_photo_groups(captured, digests, callback, cancel_event)
+    matched = [path for paths in captured for path in paths]
+    exclude = photo_exclude_patterns(request.source_root, quarantine_root)
+    groups.extend(exact_groups_outside_matches(request.source_root, matched, digests, exclude, callback, cancel_event))
+    return groups
 
 
 def exact_video_groups(records: Sequence[VideoRecord]) -> list[DuplicateGroup]:
