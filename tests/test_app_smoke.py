@@ -54,6 +54,28 @@ class DesktopAppSmokeTests(unittest.TestCase):
         page.thumbnail_pool.clear()
         page.thumbnail_pool.waitForDone()
 
+    def test_quarantine_releases_previewed_video(self) -> None:
+        # A loaded preview keeps the file open, and Windows then refuses to
+        # move it (WinError 32), so quarantine must unload it first.
+        from unittest.mock import patch
+
+        from PySide6.QtWidgets import QMessageBox
+
+        from media_sorter import ScanRequest, ScanResult
+        from media_sorter_app import MainWindow
+
+        window = MainWindow()
+        group = make_group(1, True)
+        window.scan_result = ScanResult(ScanRequest(Path("C:/library")), [group])
+        window.review_page.preview_video(group.items[1].path, group.lane)
+        self.assertFalse(window.review_page.player.source().isEmpty())
+
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), patch.object(window, "_start_worker"):
+            window.start_quarantine({group.id: {str(group.items[1].path)}})
+
+        self.assertTrue(window.review_page.player.source().isEmpty())
+        window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

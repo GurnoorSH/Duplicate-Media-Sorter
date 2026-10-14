@@ -697,6 +697,13 @@ class ReviewPage(QWidget):
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.player.play()
 
+    def release_preview(self) -> None:
+        """Unload the previewed video; a loaded source keeps the file open,
+        which stops Windows from moving it."""
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.preview_name.setText("Choose a video to preview.")
+
     def _toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
@@ -891,6 +898,7 @@ class MainWindow(QMainWindow):
         )
         if response != QMessageBox.StandardButton.Yes:
             return
+        self.review_page.release_preview()
         request = self.scan_result.request
         self.progress_page.reset("Moving duplicates to quarantine", cancellable=False)
         self.pages.setCurrentWidget(self.progress_page)
@@ -943,7 +951,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.start_page)
 
     def show_start(self) -> None:
-        self.review_page.player.stop()
+        self.review_page.release_preview()
         self.pages.setCurrentWidget(self.start_page)
 
     def open_manifest(self, path: Path) -> None:
@@ -999,7 +1007,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Files are moving", "Wait for the current move to finish before closing the app.")
             event.ignore()
             return
-        self.review_page.player.stop()
+        self.review_page.release_preview()
         super().closeEvent(event)
 
 

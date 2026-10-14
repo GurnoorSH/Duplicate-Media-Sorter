@@ -948,6 +948,20 @@ def unique_destination(destination: Path) -> Path:
     raise RuntimeError(f"could not find an unused quarantine path for {destination}")
 
 
+def discard_partial_copy(source: Path, destination: Path) -> None:
+    """Undo half of a failed move.
+
+    shutil.move copies and then deletes when a rename fails. If the delete
+    fails (the file is open elsewhere), the source is intact and the copy at
+    the freshly chosen destination is redundant, so remove it.
+    """
+    if source.exists() and destination.exists():
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+
+
 def new_manifest(source_root: Path, quarantine_root: Path) -> RunManifest:
     return RunManifest(
         version=MANIFEST_VERSION,
@@ -1013,6 +1027,7 @@ def quarantine_groups(
             moved.add(path_key(item.path))
             emit(callback, ScanProgress("quarantine", f"Moved {item.path.name}", current, total, percent(current, total)))
         except Exception as exc:
+            discard_partial_copy(item.path, destination)
             entry.status = "error"
             entry.error = str(exc)
             manifest.errors.append(f"Could not move {item.path}: {exc}")
@@ -1055,6 +1070,7 @@ def restore_entries(
                 entry.error = None
                 emit(callback, ScanProgress("restore", f"Restored {destination.name}", current, total, percent(current, total)))
             except Exception as exc:
+                discard_partial_copy(source, destination)
                 # The file is still in quarantine, so keep it restorable.
                 entry.status = "restore-error"
                 entry.error = str(exc)

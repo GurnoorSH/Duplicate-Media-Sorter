@@ -290,6 +290,51 @@ class QuarantineTests(unittest.TestCase):
             self.assertEqual(manifest.entries[0].status, "error")
             self.assertIn("stopped", RunManifest.load(manifest.path).entries[0].error)
 
+    def test_failed_move_leaves_no_partial_copy(self) -> None:
+        # shutil.move falls back to copy-then-delete; when the delete fails
+        # (file open in a player), the copy must not linger in quarantine.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "library"
+            source.mkdir()
+            kept = source / "kept.mp4"
+            duplicate = source / "copy.mp4"
+            kept.write_bytes(b"same")
+            duplicate.write_bytes(b"same")
+            group = DuplicateGroup("videos-test", EXACT_VIDEO_LANE, [item(kept, EXACT_VIDEO_LANE, 4, 1), item(duplicate, EXACT_VIDEO_LANE, 4, 2)], kept, exact=True)
+
+            def copy_then_fail(source_path: str, destination: str) -> None:
+                Path(destination).write_bytes(Path(source_path).read_bytes())
+                raise PermissionError("[WinError 32] The process cannot access the file")
+
+            manifest = quarantine_groups(source, root / "quarantine", [group], move_file=copy_then_fail)
+
+            self.assertEqual(manifest.entries[0].status, "error")
+            self.assertTrue(duplicate.exists())
+            self.assertFalse(Path(manifest.entries[0].moved_path).exists())
+
+    def test_failed_restore_leaves_no_partial_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "library"
+            source.mkdir()
+            kept = source / "kept.jpg"
+            duplicate = source / "copy.jpg"
+            kept.write_text("original", encoding="utf-8")
+            duplicate.write_text("copy", encoding="utf-8")
+            group = DuplicateGroup("photos-test", PHOTO_LANE, [item(kept, PHOTO_LANE, 8, 1), item(duplicate, PHOTO_LANE, 4, 2)], kept)
+            manifest = quarantine_groups(source, root / "quarantine", [group])
+
+            def copy_then_fail(source_path: str, destination: str) -> None:
+                Path(destination).write_bytes(Path(source_path).read_bytes())
+                raise PermissionError("in use")
+
+            restore_entries(manifest, {manifest.entries[0].id}, move_file=copy_then_fail)
+
+            self.assertEqual(manifest.entries[0].status, "restore-error")
+            self.assertFalse(duplicate.exists())
+            self.assertTrue(Path(manifest.entries[0].moved_path).exists())
+
     def test_overlapping_groups_never_quarantine_every_copy(self) -> None:
         # Exact and near video lanes can pick opposite keepers for the same pair.
         with tempfile.TemporaryDirectory() as temporary:
