@@ -402,6 +402,42 @@ class VideoTests(unittest.TestCase):
             self.assertEqual(groups[0].lane, NEAR_VIDEO_LANE)
             self.assertEqual(groups[0].keeper_path, large)
 
+    def test_vdf_4_report_with_timespan_durations(self) -> None:
+        # Shape and field formats written by vdf-cli 4.1.1 with "-f json".
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = root / "original clip.mp4"
+            resent = root / "WhatsApp Video re-sent.mp4"
+            original.write_bytes(b"xx")
+            resent.write_bytes(b"x")
+            report = [
+                {
+                    "GroupId": "ba285f0a",
+                    "Items": [
+                        {"Path": str(resent), "SizeLong": 890042, "Duration": "00:00:12", "FrameSize": "640x360", "BitRateKbs": 590},
+                        {"Path": str(original), "SizeLong": 4532298, "Duration": "1.02:03:04.5000000", "FrameSize": "1280x720", "BitRateKbs": 3018},
+                    ],
+                }
+            ]
+
+            groups = normalize_vdf_report(report)
+
+            self.assertEqual(groups[0].keeper_path, original)
+            durations = {entry.path: entry.duration_seconds for entry in groups[0].items}
+            self.assertEqual(durations[resent], 12.0)
+            self.assertEqual(durations[original], 93784.5)
+            self.assertFalse(groups[0].exact)
+
+    def test_vdf_duration_parsing(self) -> None:
+        from media_sorter import parse_duration
+
+        self.assertEqual(parse_duration("00:01:05"), 65.0)
+        self.assertEqual(parse_duration("00:00:12.2500000"), 12.25)
+        self.assertEqual(parse_duration(42), 42.0)
+        self.assertEqual(parse_duration("7.5"), 7.5)
+        self.assertIsNone(parse_duration("not a time"))
+        self.assertIsNone(parse_duration(None))
+
 
 if __name__ == "__main__":
     unittest.main()

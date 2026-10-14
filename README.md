@@ -21,13 +21,19 @@ quarantine output has been verified.
 
 ## Setup
 
-Use Python 3.12 or newer. `duplicate_images==0.11.10` requires Python 3.12.
+Use Python 3.12 (`duplicate_images==0.11.10` requires 3.12 or newer, and the
+pinned dependencies are tested on 3.12). With the Python install manager:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+py install 3.12
+py -V:3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+A virtual environment's `Scripts\*.exe` launchers (`pip.exe`, `find-dups.exe`)
+embed the absolute path they were created at. If the project folder moves,
+recreate `.venv` with the commands above. The tools themselves no longer depend
+on those launchers.
 
 The pinned Python dependency file includes:
 
@@ -87,9 +93,20 @@ file.
 For near-duplicate video scans, install VDF CLI plus FFmpeg and FFprobe shared
 binaries under `tools/`:
 
-- `tools\vdf\cli\vdf-cli.exe`
-- `tools\vdf\ffmpeg-shared\...\bin\ffmpeg.exe`
-- `tools\vdf\ffmpeg-shared\...\bin\ffprobe.exe`
+- `tools\vdf\cli\vdf-cli.exe`: unzip `CLI-win-x64.zip` from the
+  [Video Duplicate Finder releases](https://github.com/0x90d/videoduplicatefinder/releases)
+  (tested with v4.1.1).
+- `tools\vdf\ffmpeg-shared\...\bin\ffmpeg.exe` and `ffprobe.exe`: unzip an
+  FFmpeg **8.x GPL shared** build, for example
+  `ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip` from
+  [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (linked
+  from ffmpeg.org). VDF needs FFmpeg 8.x, so avoid the `master` and 9.x builds.
+
+The app finds these automatically and enables its near-video toggle. Near-video
+groups start unselected in the review screen because they are different files
+(re-encodes, resized or re-sent copies); the suggested keeper is the highest
+resolution, then bitrate, then size. If Windows Smart App Control blocks one
+of these unsigned binaries, the near-video scan stops with an error naming it.
 
 The `tools/` directory is ignored by git because these are downloaded runtime
 artifacts.
@@ -186,7 +203,7 @@ paths can be easy to misread because VDF may fall back to its default database
 beside the CLI.
 
 ```powershell
-$ffmpegBin = "C:\Path\To\Duplicate Media Sorter\tools\vdf\ffmpeg-shared\ffmpeg-8.1.1-full_build-shared\bin"
+$ffmpegBin = "C:\Path\To\Duplicate Media Sorter\tools\vdf\ffmpeg-shared\ffmpeg-n8.1-latest-win64-gpl-shared-8.1\bin"
 $db = "C:\Path\To\Duplicate Media Sorter\vdf_video_db_clean"
 $env:PATH = "$ffmpegBin;$env:PATH"
 New-Item -ItemType Directory -Force -Path $db | Out-Null

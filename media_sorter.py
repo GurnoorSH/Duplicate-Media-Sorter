@@ -805,6 +805,26 @@ def integer_value(raw: object) -> int | None:
         return None
 
 
+TIMESPAN_PATTERN = re.compile(r"^(?:(\d+)\.)?(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)$")
+
+
+def parse_duration(raw: object) -> float | None:
+    """Seconds from a number or a .NET TimeSpan string such as "00:00:12" or
+    "1.02:03:04.5000000", the format vdf-cli writes."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not isinstance(raw, str):
+        return None
+    match = TIMESPAN_PATTERN.match(raw.strip())
+    if match:
+        days, hours, minutes, seconds = match.groups()
+        return int(days or 0) * 86400 + int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def parse_frame_size(raw: object) -> tuple[int | None, int | None]:
     if isinstance(raw, str):
         match = re.search(r"(\d+)\s*[xX]\s*(\d+)", raw)
@@ -827,7 +847,7 @@ def vdf_item(raw: dict[str, object]) -> MediaItem:
         modified_ns=stat.st_mtime_ns if stat else 0,
         width=width,
         height=height,
-        duration_seconds=float(first_value(raw, ("Duration", "duration"), 0) or 0),
+        duration_seconds=parse_duration(first_value(raw, ("Duration", "duration"))),
         bitrate_kbps=integer_value(first_value(raw, ("BitRateKbs", "bitrateKbps", "BitrateKbps"))),
     )
 
