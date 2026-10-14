@@ -161,7 +161,7 @@ def duplicate_groups(records: Sequence[VideoRecord]) -> list[list[VideoRecord]]:
     return [sorted(group, key=lambda item: str(item.path).lower()) for group in buckets.values() if len(group) > 1]
 
 
-def write_report(report_path: Path, groups: Sequence["DuplicateGroup"]) -> None:
+def write_report(report_path: Path, groups: Sequence["DuplicateGroup"], empty: Sequence["DuplicateGroup"] = ()) -> None:
     if report_path.parent != Path("."):
         report_path.parent.mkdir(parents=True, exist_ok=True)
     with report_path.open("w", encoding="utf-8") as handle:
@@ -175,6 +175,9 @@ def write_report(report_path: Path, groups: Sequence["DuplicateGroup"]) -> None:
             handle.write(f"KEEP {group.keeper_path}\n")
             for item in group.duplicates:
                 handle.write(f"MOVE {item.path}\n")
+        handle.write(f"\nEmpty or zero-filled videos (no data, every byte is zero): {len(empty)}\n")
+        for group in empty:
+            handle.write(f"MOVE {group.items[0].path}  size={group.items[0].size}\n")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -193,7 +196,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     # media_sorter imports this module, so import it lazily to avoid a cycle.
-    from media_sorter import exact_video_groups, quarantine_groups
+    from media_sorter import drop_groups_with, exact_video_groups, find_empty_media, photo_exclude_patterns, quarantine_groups
 
     args = parse_args(argv)
     target = args.target.expanduser().resolve()
@@ -204,20 +207,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     quarantine_dir = (args.quarantine_dir or target.parent / f"{target.name}_video_quarantine_exact").expanduser().resolve()
     exclude = (quarantine_dir.name,) if quarantine_dir.is_relative_to(target) else ()
     records = scan_videos(target, args.cache, args.algorithm, exclude_dirs=exclude)
-    groups = exact_video_groups(records)
-    write_report(args.report, groups)
+    # Empty or zero-filled videos hold no data: report them on their own and
+    # never keep one as the original of an exact group.
+    empty = find_empty_media(target, VIDEO_EXTENSIONS, photo_exclude_patterns(target, quarantine_dir))
+    groups = drop_groups_with(exact_video_groups(records), (group.items[0].path for group in empty))
+    write_report(args.report, groups, empty)
     print(f"Exact duplicate groups: {len(groups)}")
+    print(f"Empty or zero-filled videos: {len(empty)}")
     print(f"Report: {args.report}")
 
     if args.mode == "quarantine":
         if args.dry_run_moves:
-            count = sum(len(group.duplicates) for group in groups)
-            print(f"Would move {count} exact duplicate video files to {quarantine_dir} (see MOVE lines in the report)")
+            count = sum(len(group.duplicates) for group in [*groups, *empty])
+            print(f"Would move {count} video files to {quarantine_dir} (see MOVE lines in the report)")
             return 0
-        manifest = quarantine_groups(target, quarantine_dir, groups)
+        manifest = quarantine_groups(target, quarantine_dir, [*groups, *empty])
         statuses = [entry.status for entry in manifest.entries]
         print(
-            f"Moved {statuses.count('moved')} exact duplicate video files to {quarantine_dir}, "
+            f"Moved {statuses.count('moved')} video files to {quarantine_dir}, "
             f"skipped {statuses.count('skipped')}, failed {statuses.count('error')}. Restore manifest: {manifest.path}"
         )
         return 1 if statuses.count("error") else 0

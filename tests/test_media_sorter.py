@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from media_sorter import (
     EXACT_VIDEO_LANE,
+    MEDIA_EXTENSIONS,
     NEAR_VIDEO_LANE,
     PHOTO_LANE,
     DigestCache,
@@ -102,6 +103,84 @@ class FindDupsOutputTests(unittest.TestCase):
     def test_find_dups_runs_as_module_of_current_interpreter(self) -> None:
         # A venv's find-dups.exe launcher breaks once the project folder moves.
         self.assertEqual(find_dups_command_prefix(), [sys.executable, "-m", "duplicate_images.duplicate"])
+
+
+class EmptyMediaTests(unittest.TestCase):
+    def test_detects_empty_and_zero_filled_files_only(self) -> None:
+        from media_sorter import is_empty_or_zero_filled
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = {
+                "empty.jpg": b"",
+                "zeros.mp4": bytes(3 * 4096 + 17),
+                "late_byte.mp4": bytes(9 << 20) + b"\x01",
+                "real.jpg": b"\xff\xd8" + bytes(5000),
+            }
+            for name, data in cases.items():
+                (root / name).write_bytes(data)
+
+            found = {name for name in cases if is_empty_or_zero_filled(root / name)}
+
+            self.assertEqual(found, {"empty.jpg", "zeros.mp4"})
+
+    def test_empty_media_become_keeperless_groups(self) -> None:
+        from media_sorter import ZERO_FILLED_LANE, find_empty_media
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "library"
+            quarantine = root / "library_quarantine"
+            quarantine.mkdir(parents=True)
+            (root / "dead.mp4").write_bytes(bytes(8192))
+            (root / "dead.jpg").write_bytes(b"")
+            (root / ".nomedia").write_bytes(b"")
+            (root / "notes.txt").write_bytes(bytes(10))
+            (quarantine / "old.mp4").write_bytes(bytes(10))
+
+            groups = find_empty_media(root, MEDIA_EXTENSIONS, photo_exclude_patterns(root, quarantine))
+
+            self.assertEqual(sorted(group.items[0].path.name for group in groups), ["dead.jpg", "dead.mp4"])
+            for group in groups:
+                self.assertEqual(group.lane, ZERO_FILLED_LANE)
+                self.assertIsNone(group.keeper_path)
+                self.assertEqual(group.duplicates, group.items)
+
+    def test_keeperless_group_quarantines_and_restores(self) -> None:
+        from media_sorter import find_empty_media
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "library"
+            (source / "dad pics").mkdir(parents=True)
+            dead = source / "dad pics" / "VID_1.mp4"
+            dead.write_bytes(bytes(10_000))
+
+            manifest = quarantine_groups(source, root / "quarantine", find_empty_media(source, MEDIA_EXTENSIONS))
+
+            self.assertEqual([entry.status for entry in manifest.entries], ["moved"])
+            self.assertEqual(manifest.entries[0].keeper_path, "")
+            self.assertTrue((root / "quarantine" / "empty" / "dad pics" / "VID_1.mp4").exists())
+            restore_entries(manifest, {manifest.entries[0].id})
+            self.assertTrue(dead.exists())
+
+    def test_zero_filled_copies_are_not_kept_as_duplicates(self) -> None:
+        # Two identical zero-filled videos would otherwise be an exact group
+        # that keeps one dead file as the "original".
+        from media_sorter import drop_groups_with, exact_video_groups, find_empty_media
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "a.mp4").write_bytes(bytes(5000))
+            (root / "b.mp4").write_bytes(bytes(5000))
+            (root / "c.mp4").write_bytes(b"real video")
+            (root / "d.mp4").write_bytes(b"real video")
+            exact = exact_video_groups(scan_videos(root, root / "cache.json", "sha256"))
+            empty = find_empty_media(root, MEDIA_EXTENSIONS)
+
+            remaining = drop_groups_with(exact, (group.items[0].path for group in empty))
+
+            self.assertEqual(len(exact), 2)
+            self.assertEqual([sorted(item.path.name for item in group.items) for group in remaining], [["c.mp4", "d.mp4"]])
 
 
 class ExcludePatternTests(unittest.TestCase):

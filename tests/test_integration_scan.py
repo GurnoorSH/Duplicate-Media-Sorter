@@ -89,6 +89,30 @@ class CommandLineQuarantineTests(unittest.TestCase):
             manifest = RunManifest.load(next((root / "Pics_quarantine" / ".duplicate-media-sorter" / "runs").glob("*.json")))
             self.assertEqual([entry.status for entry in manifest.entries], ["moved"])
 
+    def test_clis_quarantine_empty_and_zero_filled_media(self) -> None:
+        import dedup_manager
+        import video_exact_dedup
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            source = root / "Pics"
+            source.mkdir()
+            (source / "15730.jpg").write_bytes(b"")
+            (source / "a.mp4").write_bytes(bytes(50_000))
+            (source / "b.mp4").write_bytes(bytes(50_000))  # Identical to a.mp4, but no data.
+            (source / ".nomedia").write_bytes(b"")
+
+            photo_code = dedup_manager.main([str(source), "--mode", "quarantine", "--cache", str(root / "hashes.json"), "--no-progress"])
+            video_code = video_exact_dedup.main(
+                [str(source), "--mode", "quarantine", "--cache", str(root / "cache.json"), "--report", str(root / "report.txt")]
+            )
+
+            self.assertEqual((photo_code, video_code), (0, 0))
+            self.assertEqual([path.name for path in source.iterdir()], [".nomedia"])
+            self.assertIn("Exact duplicate video groups: 0", (root / "report.txt").read_text(encoding="utf-8"))
+            self.assertTrue((root / "Pics_quarantine" / "empty" / "15730.jpg").exists())
+            self.assertTrue((root / "Pics_video_quarantine_exact" / "empty" / "b.mp4").exists())
+
     def test_video_cli_writes_restorable_manifest(self) -> None:
         import video_exact_dedup
         from media_sorter import RunManifest, restore_entries

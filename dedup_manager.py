@@ -255,6 +255,13 @@ def format_size(value: int) -> str:
 
 def print_report(groups: Sequence[media_sorter.DuplicateGroup], include_similar: bool) -> None:
     for index, group in enumerate(groups, start=1):
+        if group.keeper_path is None:
+            size = group.items[0].size
+            detail = "empty file (0 bytes)" if size == 0 else f"{format_size(size)}, every byte is zero"
+            print(f"\nGroup {index} [EMPTY, no data]: {detail}")
+            for item in group.duplicates:
+                print(f"MOVE {item.path}")
+            continue
         kind = "IDENTICAL" if group.exact else "SIMILAR, review"
         print(f"\nGroup {index} [{kind}]: {len(group.items)} files, {format_size(group.reclaimable_bytes)} reclaimable")
         print(f"KEEP {group.keeper_path}")
@@ -262,12 +269,14 @@ def print_report(groups: Sequence[media_sorter.DuplicateGroup], include_similar:
         for item in group.duplicates:
             print(f"{verb} {item.path}")
 
-    exact = [group for group in groups if group.exact]
+    empty = [group for group in groups if group.keeper_path is None]
+    exact = [group for group in groups if group.exact and group.keeper_path is not None]
     similar = [group for group in groups if not group.exact]
     for label, chosen in (("Identical", exact), ("Similar", similar)):
         files = sum(len(group.duplicates) for group in chosen)
         size = sum(group.reclaimable_bytes for group in chosen)
         print(f"{label} groups: {len(chosen)} ({files} extra files, {format_size(size)})")
+    print(f"Empty or zero-filled photos: {len(empty)} ({format_size(sum(group.reclaimable_bytes for group in empty))})")
     if similar and not include_similar:
         print("Similar groups are reported only. Review them in the desktop app, or pass --include-similar to act on them.")
 
@@ -282,7 +291,7 @@ def print_progress(progress: media_sorter.ScanProgress) -> None:
 def delete_duplicates(groups: Sequence[media_sorter.DuplicateGroup]) -> tuple[int, int]:
     deleted = failed = 0
     for group in groups:
-        if not group.keeper_path.exists():
+        if group.keeper_path is not None and not group.keeper_path.exists():
             print(f"Skipping group: kept original is missing: {group.keeper_path}", file=sys.stderr)
             continue
         for item in group.duplicates:
@@ -336,6 +345,9 @@ def run_deduplication(config: DedupConfig) -> int:
     exclude = [*config.exclude_dirs, *media_sorter.photo_exclude_patterns(config.target, quarantine_dir)]
     matched = [path for paths in captured for path in paths]
     groups.extend(media_sorter.exact_groups_outside_matches(config.target, matched, digests, exclude, print_progress))
+    # Empty or zero-filled photos hold no data: never keep one as an original.
+    empty = media_sorter.find_empty_media(config.target, media_sorter.PHOTO_EXTENSIONS, exclude, print_progress)
+    groups = media_sorter.drop_groups_with(groups, (group.items[0].path for group in empty)) + empty
     print_report(groups, config.include_similar)
     selected = [group for group in groups if group.exact or config.include_similar]
     file_count = sum(len(group.duplicates) for group in selected)

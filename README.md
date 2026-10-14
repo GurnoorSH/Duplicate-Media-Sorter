@@ -14,6 +14,11 @@ interface for reviewing groups before anything moves:
   Photos that `find-dups` cannot decode (truncated or corrupt files, which it
   skips with a warning or ignores entirely) are still compared by size and
   SHA-256, so identical damaged copies are caught too.
+- Empty media: photos and videos that are 0 bytes or entirely zero bytes (a
+  copy or transfer that never wrote its data) are listed separately as **empty
+  files**. There is nothing to keep, so every one is selected for quarantine,
+  and they are never kept as the "original" of an identical-copy group.
+  Android marker files such as `.nomedia` are not media and are left alone.
 - Videos: exact byte-for-byte duplicate detection through
   `video_exact_dedup.py`, plus near-duplicate detection through Video Duplicate
   Finder (VDF).

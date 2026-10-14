@@ -42,6 +42,7 @@ from media_sorter import (
     NEAR_VIDEO_LANE,
     PHOTO_LANE,
     RESTORABLE_STATUSES,
+    ZERO_FILLED_LANE,
     DuplicateGroup,
     ManifestEntry,
     MediaItem,
@@ -64,6 +65,7 @@ LANE_LABELS = {
     PHOTO_LANE: "Photos",
     EXACT_VIDEO_LANE: "Exact videos",
     NEAR_VIDEO_LANE: "Near videos",
+    ZERO_FILLED_LANE: "Empty files",
 }
 # Review categories: (key, label, hint, predicate). Identical copies are
 # pre-selected; anything that only looks alike starts unselected.
@@ -77,6 +79,12 @@ REVIEW_CATEGORIES = (
     ),
     ("videos_exact", "Exact videos", "Byte-for-byte copies. Pre-selected for quarantine.", lambda group: group.lane == EXACT_VIDEO_LANE),
     ("videos_near", "Near videos", "Re-encoded or trimmed versions. Nothing is selected until you choose.", lambda group: group.lane == NEAR_VIDEO_LANE),
+    (
+        "empty_files",
+        "Empty files",
+        "Photos and videos that are 0 bytes or entirely zero bytes: the data was never written (a failed copy or transfer). Nothing can be recovered from them. Pre-selected for quarantine.",
+        lambda group: group.lane == ZERO_FILLED_LANE,
+    ),
 )
 GROUPS_PER_PAGE = 20
 
@@ -415,7 +423,9 @@ class MediaTile(QFrame):
         self.preview.setFixedSize(*THUMBNAIL_SIZE)
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setObjectName("preview")
-        if lane == PHOTO_LANE:
+        if lane == ZERO_FILLED_LANE:
+            self.preview.setText("No data\n(empty or all zero bytes)")
+        elif lane == PHOTO_LANE:
             self.preview.setText("Loading preview...")
         else:
             self.preview.setText("Video")
@@ -437,7 +447,9 @@ class MediaTile(QFrame):
         self.move_checkbox.setEnabled(not keeper)
         layout.addWidget(self.keeper_radio)
         layout.addWidget(self.move_checkbox)
-        if lane != PHOTO_LANE:
+        # An empty file has nothing worth keeping, so there is no keeper choice.
+        self.keeper_radio.setVisible(lane != ZERO_FILLED_LANE)
+        if lane not in (PHOTO_LANE, ZERO_FILLED_LANE):
             play = QPushButton("Preview video")
             play.clicked.connect(lambda: self.preview_requested.emit(self.item.path, self.lane))
             layout.addWidget(play)
@@ -462,10 +474,15 @@ class GroupCard(QFrame):
         self.setObjectName("card")
         layout = QVBoxLayout(self)
         heading = QHBoxLayout()
-        title = QLabel(f"{len(group.items)} matching files")
+        if group.lane == ZERO_FILLED_LANE:
+            title = QLabel("Empty file")
+            kind = QLabel("No data, nothing to keep")
+            kind.setObjectName("pillWarn")
+        else:
+            title = QLabel(f"{len(group.items)} matching files")
+            kind = QLabel("Identical copies" if group.exact else "Similar, review before moving")
+            kind.setObjectName("pill" if group.exact else "pillWarn")
         title.setObjectName("groupTitle")
-        kind = QLabel("Identical copies" if group.exact else "Similar, review before moving")
-        kind.setObjectName("pill" if group.exact else "pillWarn")
         reclaim = QLabel(f"{format_bytes(group.reclaimable_bytes)} reclaimable")
         reclaim.setObjectName("pill")
         heading.addWidget(title)
@@ -726,7 +743,8 @@ class ManifestGroupCard(QFrame):
         restore.clicked.connect(lambda: self.restore_group.emit({entry.id for entry in entries if entry.status in RESTORABLE_STATUSES}))
         header.addWidget(restore)
         layout.addLayout(header)
-        keeper = QLabel(f"Original kept: {entries[0].keeper_path}")
+        kept = entries[0].keeper_path
+        keeper = QLabel(f"Original kept: {kept}" if kept else "Empty or zero-filled file: there was no data to keep.")
         keeper.setWordWrap(True)
         keeper.setObjectName("hint")
         layout.addWidget(keeper)

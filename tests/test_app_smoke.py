@@ -39,6 +39,23 @@ class DesktopAppSmokeTests(unittest.TestCase):
         self.assertEqual(selections[exact.id], {str(exact.items[1].path)})
         self.assertEqual(selections[similar.id], set())
 
+    def test_empty_files_are_preselected_without_a_keeper_choice(self) -> None:
+        from media_sorter import ZERO_FILLED_LANE, DuplicateGroup, MediaItem, ScanRequest, ScanResult
+        from media_sorter_app import GroupCard, ReviewPage, default_selections
+
+        empty = DuplicateGroup("empty-1", ZERO_FILLED_LANE, [MediaItem(Path("C:/library/dead.mp4"), ZERO_FILLED_LANE, 0, 1)], None, exact=True)
+
+        self.assertEqual(default_selections([empty])[empty.id], {str(empty.items[0].path)})
+        page = ReviewPage()
+        page.set_result(ScanResult(ScanRequest(Path("C:/library")), [empty]))
+        page.lanes.setCurrentRow(page.lanes.count() - 1)
+        cards = [page.group_layout.itemAt(index).widget() for index in range(page.group_layout.count())]
+        card = next(card for card in cards if isinstance(card, GroupCard))
+        tile = next(iter(card.tiles.values()))
+        self.assertTrue(tile.keeper_radio.isHidden())
+        self.assertTrue(tile.move_checkbox.isChecked())
+        self.assertIn("Empty files  1", page.lanes.item(page.lanes.count() - 1).text())
+
     def test_review_page_renders_one_page_of_groups(self) -> None:
         from media_sorter import ScanRequest, ScanResult
         from media_sorter_app import GROUPS_PER_PAGE, GroupCard, ReviewPage

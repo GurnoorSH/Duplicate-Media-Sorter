@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from video_exact_dedup import (
+    VIDEO_EXTENSIONS,
     VideoRecord,
     VideoScanCancelled,
     duplicate_groups,
@@ -49,13 +50,18 @@ COPY_NAME_PATTERN = re.compile(r"(?:\s*-\s*copy(?:\s*\(\d+\))?|\s*\(\d+\)|[\s_]c
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 PATH_SEPARATOR_PATTERN = r"[\\/]"
 PHOTO_EXTENSIONS = frozenset({".jpg", ".jpeg", ".jpe", ".png", ".heic", ".heif", ".hif", ".webp", ".gif", ".bmp", ".tif", ".tiff"})
+MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | frozenset(VIDEO_EXTENSIONS)
 PHOTO_LANE = "photos"
 EXACT_VIDEO_LANE = "videos_exact"
 NEAR_VIDEO_LANE = "videos_near"
+# Media files that are 0 bytes or entirely zero bytes (a failed copy or
+# transfer). They hold no data, so their groups have no keeper.
+ZERO_FILLED_LANE = "zero_filled"
 LANE_FOLDERS = {
     PHOTO_LANE: Path("photos"),
     EXACT_VIDEO_LANE: Path("videos") / "exact",
     NEAR_VIDEO_LANE: Path("videos") / "near",
+    ZERO_FILLED_LANE: Path("empty"),
 }
 SYSTEM_EXCLUDE_DIRS = ("$RECYCLE.BIN", "System Volume Information")
 ProgressCallback = Callable[["ScanProgress"], None]
@@ -108,20 +114,24 @@ class DuplicateGroup:
     id: str
     lane: str
     items: list[MediaItem]
-    keeper_path: Path
+    # None for groups with nothing worth keeping (empty or zero-filled files).
+    keeper_path: Path | None
     # True when every file in the group has identical bytes. Groups that only
     # look alike (re-encodes, burst frames, edits) are False and need review.
     exact: bool = False
 
     @property
     def keeper(self) -> MediaItem:
-        for item in self.items:
-            if paths_equal(item.path, self.keeper_path):
-                return item
+        if self.keeper_path is not None:
+            for item in self.items:
+                if paths_equal(item.path, self.keeper_path):
+                    return item
         raise ValueError(f"keeper is not part of duplicate group {self.id}")
 
     @property
     def duplicates(self) -> list[MediaItem]:
+        if self.keeper_path is None:
+            return list(self.items)
         return [item for item in self.items if not paths_equal(item.path, self.keeper_path)]
 
     @property
@@ -137,7 +147,7 @@ class DuplicateGroup:
         return {
             "id": self.id,
             "lane": self.lane,
-            "keeper_path": str(self.keeper_path),
+            "keeper_path": str(self.keeper_path) if self.keeper_path is not None else None,
             "items": [item.to_dict() for item in self.items],
             "exact": self.exact,
         }
@@ -147,7 +157,7 @@ class DuplicateGroup:
         return cls(
             id=str(raw["id"]),
             lane=str(raw["lane"]),
-            keeper_path=Path(str(raw["keeper_path"])),
+            keeper_path=Path(str(raw["keeper_path"])) if raw.get("keeper_path") else None,
             items=[MediaItem.from_dict(item) for item in raw["items"]],  # type: ignore[arg-type]
             exact=bool(raw.get("exact", False)),
         )
@@ -160,6 +170,7 @@ class ScanRequest:
     include_photos: bool = True
     include_exact_videos: bool = True
     include_near_videos: bool = False
+    include_empty_files: bool = True
     photo_algorithm: str = "phash"
     photo_hash_size: int = 8
     find_dups_executable: str = "find-dups"
@@ -661,16 +672,66 @@ def build_photo_groups(
     return groups
 
 
-def iter_photo_files(root: Path, exclude_patterns: Sequence[str] = ()) -> Iterable[Path]:
-    """Photo files under root, skipping folders whose path matches an exclude
-    regex (searched against the full folder path, as find-dups does)."""
+def iter_files(root: Path, extensions: Iterable[str], exclude_patterns: Sequence[str] = ()) -> Iterable[Path]:
+    """Files under root with one of the given extensions, skipping folders
+    whose path matches an exclude regex (searched against the full folder
+    path, as find-dups does)."""
+    wanted = {extension.lower() for extension in extensions}
     compiled = [re.compile(pattern) for pattern in exclude_patterns]
     for directory, _dirs, files in os.walk(root):
         if any(pattern.search(directory) for pattern in compiled):
             continue
         for name in files:
-            if os.path.splitext(name)[1].lower() in PHOTO_EXTENSIONS:
+            if os.path.splitext(name)[1].lower() in wanted:
                 yield Path(directory, name)
+
+
+ZERO_CHUNK = bytes(8 << 20)
+
+
+def is_empty_or_zero_filled(path: Path) -> bool:
+    """True for a 0-byte file or one whose every byte is zero. Real media
+    starts with a non-zero header, so most files are rejected after 4 KB."""
+    with path.open("rb") as handle:
+        head = handle.read(4096)
+        if head != ZERO_CHUNK[: len(head)]:
+            return False
+        while chunk := handle.read(len(ZERO_CHUNK)):
+            if chunk != ZERO_CHUNK[: len(chunk)]:
+                return False
+    return True
+
+
+def find_empty_media(
+    root: Path,
+    extensions: Iterable[str],
+    exclude_patterns: Sequence[str] = (),
+    callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[DuplicateGroup]:
+    """One keeper-less group per media file that is empty or all zero bytes."""
+    groups: list[DuplicateGroup] = []
+    for path in iter_files(root, extensions, exclude_patterns):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled("scan cancelled")
+        try:
+            if not is_empty_or_zero_filled(path):
+                continue
+            item = media_item_for_file(path, ZERO_FILLED_LANE)
+        except OSError as exc:
+            emit(callback, ScanProgress("empty_files", f"Could not read {path}: {exc}", warning=True))
+            continue
+        emit(callback, ScanProgress("empty_files", f"No data in {path.name} ({item.size:,} bytes)"))
+        groups.append(DuplicateGroup(group_id(ZERO_FILLED_LANE, [path]), ZERO_FILLED_LANE, [item], None, exact=True))
+    return groups
+
+
+def drop_groups_with(groups: Iterable[DuplicateGroup], paths: Iterable[Path]) -> list[DuplicateGroup]:
+    """Drop duplicate groups containing any of these (empty or zero-filled)
+    files. Identical-copy groups share their bytes, so if one member holds no
+    data none do, and keeping one of them as the original would be wrong."""
+    excluded = {path_key(path) for path in paths}
+    return [group for group in groups if not any(path_key(item.path) in excluded for item in group.items)]
 
 
 def exact_groups_outside_matches(
@@ -689,7 +750,7 @@ def exact_groups_outside_matches(
     """
     seen = {path_key(path) for path in matched}
     by_size: dict[int, list[Path]] = defaultdict(list)
-    for path in iter_photo_files(root, exclude_patterns):
+    for path in iter_files(root, PHOTO_EXTENSIONS, exclude_patterns):
         if path_key(path) in seen:
             continue
         try:
@@ -998,6 +1059,14 @@ def scan_library(
     if request.include_near_videos:
         emit(callback, ScanProgress("videos_near", "Scanning near-duplicate videos"))
         groups.extend(scan_near_videos(request, callback, cancel_event))
+    if request.include_empty_files:
+        emit(callback, ScanProgress("empty_files", "Looking for empty or zero-filled media files"))
+        extensions = (PHOTO_EXTENSIONS if request.include_photos else frozenset()) | (
+            frozenset(VIDEO_EXTENSIONS) if request.include_exact_videos or request.include_near_videos else frozenset()
+        )
+        exclude = photo_exclude_patterns(request.source_root, request.effective_quarantine_root)
+        empty = find_empty_media(request.source_root, extensions, exclude, callback, cancel_event)
+        groups = drop_groups_with(groups, (group.items[0].path for group in empty)) + empty
     emit(callback, ScanProgress("complete", f"Found {len(groups)} duplicate groups", percent=100))
     return ScanResult(request, groups, warnings)
 
@@ -1068,7 +1137,7 @@ def quarantine_groups(
             id=uuid.uuid4().hex,
             group_id=group.id,
             lane=group.lane,
-            keeper_path=str(group.keeper_path),
+            keeper_path=str(group.keeper_path) if group.keeper_path is not None else "",
             original_path=str(item.path),
             moved_path="",
             metadata=item.to_dict(),
@@ -1076,8 +1145,10 @@ def quarantine_groups(
         manifest.entries.append(entry)
         # Never quarantine the last copy: the kept original must still be in
         # place. It can be gone when an overlapping group (exact and near
-        # video lanes) already moved it, or when the scan is stale.
-        if path_key(group.keeper_path) in moved or not group.keeper_path.exists():
+        # video lanes) already moved it, or when the scan is stale. Groups
+        # without a keeper (empty files) have no copy worth keeping.
+        keeper = group.keeper_path
+        if keeper is not None and (path_key(keeper) in moved or not keeper.exists()):
             entry.status = "skipped"
             entry.error = f"Kept original is no longer at {group.keeper_path}"
         elif not item.path.exists():
